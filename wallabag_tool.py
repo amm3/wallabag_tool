@@ -72,6 +72,10 @@ def main():
                         help="Dump the HTML content of an entry (requires --id)")
     parser.add_argument("-r", "--retag", action="store_true", default=False,
                         help="Re-run LLM tagging on an existing entry (requires --id)")
+    parser.add_argument("--list-untagged", action="store_true", default=False,
+                        help="List all entries that have no tags")
+    parser.add_argument("--retag-untagged", action="store_true", default=False,
+                        help="Re-run LLM tagging on all entries that have no tags")
     
     # HTML processing arguments
     parser.add_argument("--clean", action="store_true", default=False,
@@ -233,6 +237,108 @@ def main():
         new_tags = [t.get('label') for t in updated.get('tags', []) if t.get('label')]
         log_info(f"Updated entry id={args.id} with tags: {new_tags}")
         write_out(f"Retagged entry id={args.id} title={updated.get('title')!r} tags={new_tags}")
+        sys.exit(0)
+
+    if args.list_untagged:
+        token = oauth_token_password_grant(base_url, client_id, client_secret, username, password)
+        log_debug("Obtained access token.")
+        untagged = get_untagged_entries(base_url, token, detail="metadata")
+        if not untagged:
+            write_out("No untagged entries found.")
+        else:
+            write_out(f"Found {len(untagged)} untagged entries:")
+            for entry in untagged:
+                write_out(f"  id={entry.get('id', '?')} title={entry.get('title', 'Untitled')!r} url={entry.get('url', '')}")
+        sys.exit(0)
+
+    if args.retag_untagged:
+        if args.id is not None:
+            log_fatal("--retag-untagged operates on all untagged entries. Do not use with --id.", exit_code=2)
+
+        # Validate LLM config
+        if llm_provider == "openai":
+            if "OPENAI" not in config:
+                log_fatal("--retag-untagged requires [OPENAI] section in config file.", exit_code=2)
+            api_key = config["OPENAI"].get("API_KEY")
+            if not api_key:
+                log_fatal("OPENAI API_KEY not set in config file", exit_code=2)
+
+        token = oauth_token_password_grant(base_url, client_id, client_secret, username, password)
+        log_debug("Obtained access token.")
+
+        # Phase 1: Discover untagged entries (lightweight metadata scan)
+        write_out("Scanning for untagged entries...")
+        untagged = get_untagged_entries(base_url, token, detail="metadata")
+
+        if not untagged:
+            write_out("No untagged entries found. Nothing to do.")
+            sys.exit(0)
+
+        write_out(f"Found {len(untagged)} untagged entries. Starting LLM tagging...")
+
+        # Fetch allowed tags once (reused for all entries)
+        allowed = [t.get("label") for t in get_all_tags(base_url, token) if t.get("label")]
+
+        # Phase 2: Retag each entry
+        tagged_count = 0
+        skipped_count = 0
+        error_count = 0
+
+        for i, entry_meta in enumerate(untagged, 1):
+            entry_id = entry_meta.get('id')
+            entry_title = entry_meta.get('title', 'Untitled')
+            write_out(f"[{i}/{len(untagged)}] Processing id={entry_id} title={entry_title!r}...")
+
+            try:
+                # Fetch full entry content
+                entry = get_entry_by_id(base_url, token, entry_id)
+                if not entry:
+                    log_warning(f"Entry id={entry_id} not found. Skipping.")
+                    skipped_count += 1
+                    continue
+
+                html_content = entry.get('content', '')
+                if not html_content:
+                    log_warning(f"Entry id={entry_id} has no content. Skipping.")
+                    skipped_count += 1
+                    continue
+
+                # Run LLM tagging
+                plain_text = html_to_text(html_content)
+                if llm_provider == "ollama":
+                    llm_existing, llm_proposed = choose_tags_with_ollama(
+                        ollama_url, ollama_model, plain_text, allowed,
+                        max_tags=6, tag_notes=tag_notes, api_key=ollama_api_key)
+                else:
+                    model = config["OPENAI"].get("TAG_MODEL", "gpt-4o-mini")
+                    llm_existing, llm_proposed = choose_tags_with_llm(
+                        api_key, model, plain_text, allowed,
+                        max_tags=6, tag_notes=tag_notes)
+
+                log_info(f"LLM selected tags: {llm_existing}")
+                if llm_proposed:
+                    log_info(f"LLM proposed new tags: {llm_proposed}")
+
+                if not llm_existing:
+                    log_warning(f"LLM returned no tags for id={entry_id}. Skipping.")
+                    skipped_count += 1
+                    continue
+
+                # Patch entry with tags
+                tags_csv = ",".join(llm_existing)
+                data = {"tags": tags_csv}
+                updated = patch_entry(base_url, token, entry_id, data)
+
+                new_tags = [t.get('label') for t in updated.get('tags', []) if t.get('label')]
+                write_out(f"  Tagged id={entry_id} with: {new_tags}")
+                tagged_count += 1
+
+            except Exception as e:
+                log_error(f"Failed to retag id={entry_id}: {e}")
+                error_count += 1
+                continue
+
+        write_out(f"\nDone. Tagged: {tagged_count}, Skipped: {skipped_count}, Errors: {error_count}")
         sys.exit(0)
 
     ######################################
@@ -615,6 +721,56 @@ def get_last_entry(base_url, token):
     if items:
         return items[0]
     return None
+
+
+def get_untagged_entries(base_url, token, detail="metadata"):
+    """Fetch all entries that have no tags.
+
+    Paginates through all entries and filters client-side since the
+    Wallabag API has no server-side filter for untagged entries.
+
+    Args:
+        base_url: Wallabag instance base URL.
+        token: OAuth access token.
+        detail: "metadata" for lightweight listing, "full" to include HTML content.
+
+    Returns:
+        List of entry dicts with zero tags.
+    """
+    url = f"{base_url}/api/entries.json"
+    headers = {"Authorization": f"Bearer {token}"}
+    per_page = 30
+    page = 1
+    results = []
+
+    # First request to discover total pages
+    params = {"perPage": per_page, "page": page, "detail": detail}
+    resp = requests.get(url, headers=headers, params=params, timeout=30)
+    resp.raise_for_status()
+    body = resp.json()
+
+    total_pages = body.get("pages", 1)
+    log_info(f"Scanning entries: {body.get('total', 0)} total across {total_pages} pages")
+
+    while True:
+        if page > 1:
+            params = {"perPage": per_page, "page": page, "detail": detail}
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+            resp.raise_for_status()
+            body = resp.json()
+
+        items = body.get("_embedded", {}).get("items", [])
+        for entry in items:
+            if not entry.get("tags", []):
+                results.append(entry)
+
+        print(f"  Scanned page {page}/{total_pages}...", file=sys.stderr)
+
+        if page >= total_pages:
+            break
+        page += 1
+
+    return results
 
 
 def post_entry(base_url, token, data):

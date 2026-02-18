@@ -137,6 +137,12 @@ pbpaste | ./wallabag_tool.py --last -
 ./wallabag_tool.py --list-tags
 ```
 
+### List Untagged Articles
+
+```bash
+./wallabag_tool.py --list-untagged
+```
+
 ### Dump Article HTML
 
 ```bash
@@ -174,6 +180,12 @@ pbpaste | wallabag_tool.py -l -
 
 ```bash
 wallabag_tool.py -lr
+```
+
+**Retag all untagged articles** using LLM:
+
+```bash
+wallabag_tool.py --retag-untagged
 ```
 
 ## Advanced Usage
@@ -303,9 +315,11 @@ Content:
   --clean               Use readability preprocessing to extract article content
 
 Other:
-  --list-tags                   List all tags
+  --list-tags           List all tags
+  --list-untagged       List all entries with no tags
   --dump-html --id ID   Export entry HTML
   -r, --retag           Re-run LLM tagging on an existing entry
+  --retag-untagged      Re-run LLM tagging on all untagged entries
 ```
 
 ## Tips & Best Practices
