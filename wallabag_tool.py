@@ -6,6 +6,7 @@ import argparse
 import logging
 import configparser
 from pathlib import Path
+from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import json
 import requests
@@ -65,7 +66,9 @@ def main():
     parser.add_argument("--url", help="URL to add or update. Strips UTM parameters and checks for existing entries.")
     parser.add_argument("--title", help="Optional custom title.")
     parser.add_argument("--tags", help="Comma-separated tags (e.g. 'manual,imported')")
-    parser.add_argument("--skip-existing", action="store_true", default=False, 
+    parser.add_argument("--published-at", dest="published_at",
+                        help="Original publication date (e.g. '2024-03-15' or '2024-03-15T10:30:00+00:00')")
+    parser.add_argument("--skip-existing", action="store_true", default=False,
                         help="When used with --url, skip adding if entry already exists (only works in add mode, not update)")
     parser.add_argument("--list-tags", action="store_true", default=False, help="List tags")
     parser.add_argument("--dump-html", action="store_true", default=False,
@@ -82,6 +85,10 @@ def main():
                         help="Use readability preprocessing to extract article content (default: send raw HTML to Wallabag)")
     
     args = parser.parse_args()
+
+    # Normalize --published-at early so all code paths see the canonical form
+    if args.published_at:
+        args.published_at = normalize_published_at(args.published_at)
 
     ######################################
     # Establish LOGLEVEL
@@ -423,7 +430,9 @@ def main():
             }
             if tags_to_send:
                 data["tags"] = tags_to_send
-            
+            if args.published_at:
+                data["published_at"] = args.published_at
+
             updated = patch_entry(base_url, token, entry_id, data)
             log_info(f"Updated entry id={entry_id}")
             write_out(f"Updated entry id={entry_id} title={updated.get('title')!r}")
@@ -484,12 +493,34 @@ def main():
             }
             if tags_to_send:
                 data["tags"] = tags_to_send
-            
+            if args.published_at:
+                data["published_at"] = args.published_at
+
             new_entry = post_entry(base_url, token, data)
             entry_id = new_entry.get('id')
             log_info(f"Created new entry id={entry_id}")
             write_out(f"Created entry id={entry_id} title={new_entry.get('title')!r}")
         
+        return 0
+
+    ######################################
+    # Metadata-only update (no HTML content needed)
+    ######################################
+    if args.id is not None and args.html is None:
+        data = {}
+        if args.title:
+            data["title"] = args.title
+        if args.tags:
+            data["tags"] = args.tags
+        if args.published_at:
+            data["published_at"] = args.published_at
+        if not data:
+            log_fatal("Nothing to update. Provide --title, --tags, or --published-at.", exit_code=2)
+        token = oauth_token_password_grant(base_url, client_id, client_secret, username, password)
+        log_debug("Obtained access token.")
+        updated = patch_entry(base_url, token, args.id, data)
+        log_info(f"Updated entry id={args.id}")
+        write_out(f"Updated entry id={args.id} title={updated.get('title')!r}")
         return 0
 
     ######################################
@@ -561,7 +592,9 @@ def main():
             data["title"] = args.title
         if tags_to_send:
             data["tags"] = tags_to_send
-        
+        if args.published_at:
+            data["published_at"] = args.published_at
+
         updated = patch_entry(base_url, token, args.id, data)
         log_info(f"Updated entry id={args.id}")
         write_out(f"Updated entry id={args.id} title={updated.get('title')!r}")
@@ -574,7 +607,9 @@ def main():
             data["title"] = title or "Untitled"
         if tags_to_send:
             data["tags"] = tags_to_send
-        
+        if args.published_at:
+            data["published_at"] = args.published_at
+
         new_entry = post_entry(base_url, token, data)
         entry_id = new_entry.get('id')
         log_info(f"Created new entry id={entry_id}")
@@ -623,6 +658,26 @@ def log_fatal(msg, exit_code=1):
 def write_out(msg):
     """Write to stdout."""
     print(msg)
+
+
+######################################
+# Date Utilities
+######################################
+def normalize_published_at(value):
+    """Normalize a date string to ISO 8601 format for the Wallabag API.
+
+    Accepts bare dates like '2024-03-15' (treated as midnight UTC)
+    or full ISO 8601 datetimes which are passed through."""
+    value = value.strip()
+    # Bare date: YYYY-MM-DD
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+        return value + "T00:00:00+00:00"
+    # Already looks like a full datetime — validate it parses
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        log_fatal(f"Invalid date format for --published-at: {value!r}. Use YYYY-MM-DD or full ISO 8601.", exit_code=2)
+    return value
 
 
 ######################################
