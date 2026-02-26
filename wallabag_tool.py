@@ -68,6 +68,8 @@ def main():
     parser.add_argument("--tags", help="Comma-separated tags (e.g. 'manual,imported')")
     parser.add_argument("--published-at", dest="published_at",
                         help="Original publication date (e.g. '2024-03-15' or '2024-03-15T10:30:00+00:00')")
+    parser.add_argument("--author", dest="author",
+                        help="Author name(s) for the entry (e.g. 'Jane Doe' or 'Jane Doe, John Smith')")
     parser.add_argument("--skip-existing", action="store_true", default=False,
                         help="When used with --url, skip adding if entry already exists (only works in add mode, not update)")
     parser.add_argument("--list-tags", action="store_true", default=False, help="List tags")
@@ -432,6 +434,8 @@ def main():
                 data["tags"] = tags_to_send
             if args.published_at:
                 data["published_at"] = args.published_at
+            if args.author:
+                data["authors"] = args.author
 
             updated = patch_entry(base_url, token, entry_id, data)
             log_info(f"Updated entry id={entry_id}")
@@ -495,6 +499,8 @@ def main():
                 data["tags"] = tags_to_send
             if args.published_at:
                 data["published_at"] = args.published_at
+            if args.author:
+                data["authors"] = args.author
 
             new_entry = post_entry(base_url, token, data)
             entry_id = new_entry.get('id')
@@ -514,8 +520,10 @@ def main():
             data["tags"] = args.tags
         if args.published_at:
             data["published_at"] = args.published_at
+        if args.author:
+            data["authors"] = args.author
         if not data:
-            log_fatal("Nothing to update. Provide --title, --tags, or --published-at.", exit_code=2)
+            log_fatal("Nothing to update. Provide --title, --tags, --published-at, or --author.", exit_code=2)
         token = oauth_token_password_grant(base_url, client_id, client_secret, username, password)
         log_debug("Obtained access token.")
         updated = patch_entry(base_url, token, args.id, data)
@@ -594,6 +602,8 @@ def main():
             data["tags"] = tags_to_send
         if args.published_at:
             data["published_at"] = args.published_at
+        if args.author:
+            data["authors"] = args.author
 
         updated = patch_entry(base_url, token, args.id, data)
         log_info(f"Updated entry id={args.id}")
@@ -609,6 +619,8 @@ def main():
             data["tags"] = tags_to_send
         if args.published_at:
             data["published_at"] = args.published_at
+        if args.author:
+            data["authors"] = args.author
 
         new_entry = post_entry(base_url, token, data)
         entry_id = new_entry.get('id')
