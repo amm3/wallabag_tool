@@ -7,6 +7,7 @@ import logging
 import configparser
 from pathlib import Path
 from datetime import datetime, timezone
+import zoneinfo
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import json
 import requests
@@ -28,6 +29,7 @@ CLIENTSECRET = your_client_secret
 USERNAME = your_username
 PASSWORD = your_password
 LLM_PROVIDER = openai  # or "ollama"
+TIMEZONE = America/New_York  # optional; IANA timezone for --published-at (default: system local)
 
 [OPENAI]
 API_KEY = sk-proj-...
@@ -67,7 +69,7 @@ def main():
     parser.add_argument("--title", help="Optional custom title.")
     parser.add_argument("--tags", help="Comma-separated tags (e.g. 'manual,imported')")
     parser.add_argument("--published-at", dest="published_at",
-                        help="Original publication date (e.g. '2024-03-15' or '2024-03-15T10:30:00+00:00')")
+                        help="Original publication date (e.g. '2024-03-15', '2024-03-15 4:43 PM', '2024-03-15 16:43', or full ISO 8601)")
     parser.add_argument("--author", dest="author",
                         help="Author name(s) for the entry (e.g. 'Jane Doe' or 'Jane Doe, John Smith')")
     parser.add_argument("--skip-existing", action="store_true", default=False,
@@ -87,10 +89,6 @@ def main():
                         help="Use readability preprocessing to extract article content (default: send raw HTML to Wallabag)")
     
     args = parser.parse_args()
-
-    # Normalize --published-at early so all code paths see the canonical form
-    if args.published_at:
-        args.published_at = normalize_published_at(args.published_at)
 
     ######################################
     # Establish LOGLEVEL
@@ -122,6 +120,20 @@ def main():
 
     if not all([base_url, client_id, client_secret, username, password]):
         log_fatal("Incomplete Wallabag configuration. Required keys in [WALLABAG]: BASEURL, CLIENTID, CLIENTSECRET, USERNAME, PASSWORD", exit_code=2)
+
+    # Resolve timezone for --published-at (before normalization)
+    tz_name = cfg.get("TIMEZONE", "").strip()
+    if tz_name:
+        try:
+            pub_tz = zoneinfo.ZoneInfo(tz_name)
+        except zoneinfo.ZoneInfoNotFoundError:
+            log_fatal(f"Unknown TIMEZONE in config: {tz_name!r}. Use an IANA name like 'America/New_York'.", exit_code=2)
+    else:
+        pub_tz = datetime.now().astimezone().tzinfo  # system local timezone
+
+    # Normalize --published-at now that we have the timezone
+    if args.published_at:
+        args.published_at = normalize_published_at(args.published_at, tz=pub_tz)
 
     # Load optional tag notes for LLM disambiguation
     tag_notes = dict(config["TAGNOTES"]) if "TAGNOTES" in config else None
@@ -675,20 +687,51 @@ def write_out(msg):
 ######################################
 # Date Utilities
 ######################################
-def normalize_published_at(value):
+def normalize_published_at(value, tz=None):
     """Normalize a date string to ISO 8601 format for the Wallabag API.
 
-    Accepts bare dates like '2024-03-15' (treated as midnight UTC)
-    or full ISO 8601 datetimes which are passed through."""
+    Accepts:
+      - Bare date:              '2024-03-15'             → midnight local/configured tz
+      - Date + 12-hour time:    '2024-03-15 4:43 PM'    → local/configured tz
+      - Date + 24-hour time:    '2024-03-15 16:43'      → local/configured tz
+      - Full ISO 8601:          '2024-03-15T10:30:00+00:00' → passed through as-is
+
+    tz: a tzinfo object. Defaults to the system local timezone.
+    """
     value = value.strip()
+
+    if tz is None:
+        tz = datetime.now().astimezone().tzinfo
+
     # Bare date: YYYY-MM-DD
     if re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
-        return value + "T00:00:00+00:00"
+        y, m, d = value.split('-')
+        dt = datetime(int(y), int(m), int(d), tzinfo=tz)
+        return dt.isoformat()
+
+    # Human-friendly formats (no timezone — attach tz)
+    human_formats = [
+        "%Y-%m-%d %I:%M %p",   # 2026-02-25 4:43 PM
+        "%Y-%m-%d %I:%M%p",    # 2026-02-25 4:43PM
+        "%Y-%m-%d %H:%M",      # 2026-02-25 16:43
+        "%Y-%m-%d %H:%M:%S",   # 2026-02-25 16:43:00
+    ]
+    for fmt in human_formats:
+        try:
+            dt = datetime.strptime(value, fmt).replace(tzinfo=tz)
+            return dt.isoformat()
+        except ValueError:
+            continue
+
     # Already looks like a full datetime — validate it parses
     try:
         datetime.fromisoformat(value)
     except ValueError:
-        log_fatal(f"Invalid date format for --published-at: {value!r}. Use YYYY-MM-DD or full ISO 8601.", exit_code=2)
+        log_fatal(
+            f"Invalid date format for --published-at: {value!r}. "
+            "Use YYYY-MM-DD, 'YYYY-MM-DD HH:MM AM/PM', 'YYYY-MM-DD HH:MM', or full ISO 8601.",
+            exit_code=2,
+        )
     return value
 
 
