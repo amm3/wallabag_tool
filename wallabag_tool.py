@@ -87,6 +87,8 @@ def main():
     # HTML processing arguments
     parser.add_argument("--clean", action="store_true", default=False,
                         help="Use readability preprocessing to extract article content (default: send raw HTML to Wallabag)")
+    parser.add_argument("--twitter", action="store_true", default=False,
+                        help="Clean Twitter/X HTML, preserving paragraph breaks in tweet text (for HTML copied from browser dev tools)")
     
     args = parser.parse_args()
 
@@ -251,10 +253,16 @@ def main():
             log_warning("No tags to apply.")
             sys.exit(0)
         
-        # Update entry with new tags
+        # Update entry with tags and any other metadata flags
         data = {"tags": tags_to_send}
+        if args.title:
+            data["title"] = args.title
+        if args.published_at:
+            data["published_at"] = args.published_at
+        if args.author:
+            data["authors"] = args.author
         updated = patch_entry(base_url, token, args.id, data)
-        
+
         new_tags = [t.get('label') for t in updated.get('tags', []) if t.get('label')]
         log_info(f"Updated entry id={args.id} with tags: {new_tags}")
         write_out(f"Retagged entry id={args.id} title={updated.get('title')!r} tags={new_tags}")
@@ -563,8 +571,11 @@ def main():
     if not html_input or not html_input.strip():
         log_fatal("No HTML content provided.", exit_code=2)
 
-    # Clean HTML (only if --clean is set, otherwise send raw HTML to Wallabag)
-    if args.clean:
+    # Clean HTML based on selected mode
+    if args.twitter:
+        title, cleaned = clean_twitter_html(html_input)
+        log_info("Extracted tweet content with paragraph preservation.")
+    elif args.clean:
         title, cleaned = clean_html_with_readability(html_input)
         log_info("Extracted readable content.")
     else:
@@ -940,6 +951,60 @@ def clean_html_with_readability(html_input):
     title = doc.title()
     cleaned = doc.summary()
     return title, cleaned
+
+
+def _extract_twitter_title(doc):
+    """Extract a useful title from a parsed Twitter/X lxml document."""
+    og_title = doc.xpath('//meta[@property="og:title"]/@content')
+    if og_title and og_title[0].strip():
+        return og_title[0].strip()
+    title_tags = doc.xpath('//title/text()')
+    if title_tags:
+        t = title_tags[0].strip()
+        if t and t not in ('X', 'Twitter', 'X / Twitter'):
+            return t
+    return None
+
+
+def clean_twitter_html(html_input):
+    """Extract tweet content from Twitter/X HTML, preserving paragraph structure.
+
+    Twitter stores paragraph breaks as literal \\n\\n in text content rather than
+    HTML block elements, causing Wallabag to collapse everything into one paragraph.
+    Finds data-testid="tweetText" elements and converts newlines into <p> tags.
+    Falls back to readability if no tweet elements are found.
+    """
+    from lxml import html as lxml_html
+
+    doc = lxml_html.fromstring(html_input)
+    tweet_divs = doc.xpath('//*[@data-testid="tweetText"]')
+
+    if not tweet_divs:
+        log_warning("No tweetText elements found in HTML; falling back to readability")
+        return clean_html_with_readability(html_input)
+
+    output_parts = []
+    for i, tweet_div in enumerate(tweet_divs):
+        if i > 0:
+            output_parts.append('<hr>')
+        tweet_text = tweet_div.text_content()
+        # Split on double newlines (paragraph breaks Twitter uses instead of <p>)
+        paragraphs = re.split(r'\n\n+', tweet_text)
+        for para in paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+            # Convert remaining single newlines to <br>
+            lines = [html_module.escape(line.strip()) for line in para.split('\n') if line.strip()]
+            if lines:
+                output_parts.append(f'<p>{"<br>".join(lines)}</p>')
+
+    if not output_parts:
+        log_warning("No tweet content extracted; falling back to readability")
+        return clean_html_with_readability(html_input)
+
+    title = _extract_twitter_title(doc)
+    return title, '\n'.join(output_parts)
 
 
 ######################################
