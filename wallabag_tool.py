@@ -573,8 +573,14 @@ def main():
 
     # Clean HTML based on selected mode
     if args.twitter:
-        title, cleaned = clean_twitter_html(html_input)
+        title, cleaned, tweet_time, tweet_author = clean_twitter_html(html_input)
         log_info("Extracted tweet content with paragraph preservation.")
+        if tweet_time and not args.published_at:
+            args.published_at = tweet_time
+            log_info(f"Extracted published_at from <time> tag: {tweet_time}")
+        if tweet_author and not args.author:
+            args.author = tweet_author
+            log_info(f"Extracted author from tweet: {tweet_author}")
     elif args.clean:
         title, cleaned = clean_html_with_readability(html_input)
         log_info("Extracted readable content.")
@@ -953,6 +959,26 @@ def clean_html_with_readability(html_input):
     return title, cleaned
 
 
+def _extract_twitter_author(doc):
+    """Extract the tweet author's display name and handle from a parsed Twitter/X document."""
+    user_name_divs = doc.xpath('//*[@data-testid="User-Name"]')
+    if not user_name_divs:
+        return None
+    user_name_div = user_name_divs[0]
+
+    # Display name: first <a role="link"> without tabindex
+    display_links = user_name_div.xpath('.//a[@role="link" and not(@tabindex)]')
+    display_name = display_links[0].text_content().strip() if display_links else None
+
+    # Handle: <a> with tabindex="-1"
+    handle_links = user_name_div.xpath('.//a[@tabindex="-1"]')
+    handle = handle_links[0].text_content().strip() if handle_links else None
+
+    if display_name and handle:
+        return f"{display_name} ({handle})"
+    return display_name or handle
+
+
 def _extract_twitter_title(doc):
     """Extract a useful title from a parsed Twitter/X lxml document."""
     og_title = doc.xpath('//meta[@property="og:title"]/@content')
@@ -981,7 +1007,8 @@ def clean_twitter_html(html_input):
 
     if not tweet_divs:
         log_warning("No tweetText elements found in HTML; falling back to readability")
-        return clean_html_with_readability(html_input)
+        title, cleaned = clean_html_with_readability(html_input)
+        return title, cleaned, None, None
 
     output_parts = []
     for i, tweet_div in enumerate(tweet_divs):
@@ -1001,10 +1028,20 @@ def clean_twitter_html(html_input):
 
     if not output_parts:
         log_warning("No tweet content extracted; falling back to readability")
-        return clean_html_with_readability(html_input)
+        title, cleaned = clean_html_with_readability(html_input)
+        return title, cleaned, None, None
 
     title = _extract_twitter_title(doc)
-    return title, '\n'.join(output_parts)
+
+    # Extract published_at from the first <time datetime="..."> tag
+    time_tags = doc.xpath('//time/@datetime')
+    tweet_time = time_tags[0].strip() if time_tags else None
+    if tweet_time and tweet_time.endswith('Z'):
+        tweet_time = tweet_time[:-1] + '+00:00'
+
+    tweet_author = _extract_twitter_author(doc)
+
+    return title, '\n'.join(output_parts), tweet_time, tweet_author
 
 
 ######################################
