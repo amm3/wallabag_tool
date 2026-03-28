@@ -118,6 +118,28 @@ cat article.html | ./wallabag_tool.py -
 ./wallabag_tool.py article.html --tags "saved,reading-list"
 ```
 
+### Add Article from Twitter/X HTML
+
+For tweets saved via browser dev tools:
+
+```bash
+./wallabag_tool.py --twitter tweet.html
+pbpaste | ./wallabag_tool.py --twitter -
+```
+
+The `--twitter` mode preserves paragraph breaks, detects threads, and uses the LLM to generate a headline title.
+
+### Add Article from Facebook HTML
+
+For Facebook posts saved via browser dev tools:
+
+```bash
+./wallabag_tool.py --facebook post.html
+pbpaste | ./wallabag_tool.py --facebook -
+```
+
+The `--facebook` mode extracts post content, author, and date from the raw HTML.
+
 ### Update Existing Article
 
 ```bash
@@ -294,7 +316,7 @@ done < urls.txt
 ```
 usage: wallabag_tool.py [-h] [-v] [-vv] [-c [CONFIG]] [--url URL] [--title TITLE]
                         [--tags TAGS] [--skip-existing] [-i ID] [-l] [--list-tags]
-                        [--dump-html] [-r] [--clean]
+                        [--dump-html] [-r] [--clean] [--twitter] [--facebook]
                         [HTML_FILE]
 
 Options:
@@ -310,14 +332,21 @@ Content:
   HTML_FILE             HTML file or '-' for stdin
   --title TITLE         Custom title
   --tags TAGS           Comma-separated tags
+  -p, --published-at    Original publication date (e.g. '2024-03-15' or ISO 8601)
+  --author              Author name(s) for the entry
   -i ID, --id ID        Entry ID to update
   -l, --last            Update the most recently created entry
   --clean               Use readability preprocessing to extract article content
+  --twitter             Clean Twitter/X HTML from browser dev tools
+  --facebook            Clean Facebook HTML from browser dev tools
 
 Other:
   --list-tags           List all tags
   --list-untagged       List all entries with no tags
+  --untagged-exhaustive Scan every page (default stops after 20 consecutive tagged entries)
   --dump-html --id ID   Export entry HTML
+  --save-article        Save entry as self-contained HTML file (requires --id)
+  -o, --output          Output filename for --save-article (default: <id>-<slug>.html)
   -r, --retag           Re-run LLM tagging on an existing entry
   --retag-untagged      Re-run LLM tagging on all untagged entries
 ```
