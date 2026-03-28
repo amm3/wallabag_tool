@@ -68,7 +68,7 @@ def main():
     parser.add_argument("--url", help="URL to add or update. Strips UTM parameters and checks for existing entries.")
     parser.add_argument("--title", help="Optional custom title.")
     parser.add_argument("--tags", help="Comma-separated tags (e.g. 'manual,imported')")
-    parser.add_argument("--published-at", dest="published_at",
+    parser.add_argument("--published-at", "-p", dest="published_at",
                         help="Original publication date (e.g. '2024-03-15', '2024-03-15 4:43 PM', '2024-03-15 16:43', or full ISO 8601)")
     parser.add_argument("--author", dest="author",
                         help="Author name(s) for the entry (e.g. 'Jane Doe' or 'Jane Doe, John Smith')")
@@ -77,10 +77,16 @@ def main():
     parser.add_argument("--list-tags", action="store_true", default=False, help="List tags")
     parser.add_argument("--dump-html", action="store_true", default=False,
                         help="Dump the HTML content of an entry (requires --id)")
+    parser.add_argument("--save-article", action="store_true", default=False,
+                        help="Save article as a self-contained HTML file (requires --id)")
+    parser.add_argument("-o", "--output", dest="output",
+                        help="Output filename for --save-article (default: <id>-<slug>.html). Use '-' for stdout.")
     parser.add_argument("-r", "--retag", action="store_true", default=False,
                         help="Re-run LLM tagging on an existing entry (requires --id)")
     parser.add_argument("--list-untagged", action="store_true", default=False,
                         help="List all entries that have no tags")
+    parser.add_argument("--untagged-exhaustive", action="store_true", default=False,
+                        help="With --list-untagged/--retag-untagged: scan every page instead of stopping after 20 consecutive tagged entries")
     parser.add_argument("--retag-untagged", action="store_true", default=False,
                         help="Re-run LLM tagging on all entries that have no tags")
     
@@ -89,6 +95,8 @@ def main():
                         help="Use readability preprocessing to extract article content (default: send raw HTML to Wallabag)")
     parser.add_argument("--twitter", action="store_true", default=False,
                         help="Clean Twitter/X HTML, preserving paragraph breaks in tweet text (for HTML copied from browser dev tools)")
+    parser.add_argument("--facebook", action="store_true", default=False,
+                        help="Clean Facebook HTML, extracting post content and author (for HTML saved from browser dev tools)")
     
     args = parser.parse_args()
 
@@ -198,6 +206,27 @@ def main():
             log_fatal(f"Entry id={args.id} not found.", exit_code=1)
         sys.exit(0)
 
+    if args.save_article:
+        if args.id is None:
+            log_fatal("--save-article requires --id to specify which entry to save.", exit_code=2)
+        token = oauth_token_password_grant(base_url, client_id, client_secret, username, password)
+        log_debug("Obtained access token.")
+        entry = get_entry_by_id(base_url, token, args.id)
+        if not entry:
+            log_fatal(f"Entry id={args.id} not found.", exit_code=1)
+        html_out = render_article_html(entry)
+        output_path = args.output
+        if output_path == "-":
+            print(html_out)
+        else:
+            if not output_path:
+                slug = _slugify(entry.get("title") or str(args.id))
+                output_path = f"{args.id}-{slug}.html"
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(html_out)
+            log_warning(f"Saved article to {output_path}")
+        sys.exit(0)
+
     if args.retag:
         if args.id is None:
             log_fatal("--retag requires --id to specify which entry to retag.", exit_code=2)
@@ -271,7 +300,7 @@ def main():
     if args.list_untagged:
         token = oauth_token_password_grant(base_url, client_id, client_secret, username, password)
         log_debug("Obtained access token.")
-        untagged = get_untagged_entries(base_url, token, detail="metadata")
+        untagged = get_untagged_entries(base_url, token, detail="metadata", exhaustive=args.untagged_exhaustive)
         if not untagged:
             write_out("No untagged entries found.")
         else:
@@ -297,7 +326,7 @@ def main():
 
         # Phase 1: Discover untagged entries (lightweight metadata scan)
         write_out("Scanning for untagged entries...")
-        untagged = get_untagged_entries(base_url, token, detail="metadata")
+        untagged = get_untagged_entries(base_url, token, detail="metadata", exhaustive=args.untagged_exhaustive)
 
         if not untagged:
             write_out("No untagged entries found. Nothing to do.")
@@ -571,6 +600,27 @@ def main():
     if not html_input or not html_input.strip():
         log_fatal("No HTML content provided.", exit_code=2)
 
+    # Extract date from JSON script tags (runs for all modes, before mode-specific processing)
+    if not args.published_at:
+        json_date = extract_date_from_json_scripts(html_input)
+        if json_date:
+            args.published_at = json_date
+            log_info(f"Extracted published_at from JSON script data: {json_date}")
+
+    # Fallback: extract date from <article> tag attributes (e.g. data-last-updated)
+    if not args.published_at:
+        article_date = extract_date_from_article_tag(html_input)
+        if article_date:
+            args.published_at = article_date
+            log_info(f"Extracted published_at from <article> attribute: {article_date}")
+
+    # Fallback: extract date from <time datetime="..."> elements
+    if not args.published_at:
+        time_date = extract_date_from_time_element(html_input)
+        if time_date:
+            args.published_at = time_date
+            log_info(f"Extracted published_at from <time datetime> element: {time_date}")
+
     # Clean HTML based on selected mode
     if args.twitter:
         title, cleaned, tweet_time, tweet_author = clean_twitter_html(html_input)
@@ -581,6 +631,14 @@ def main():
         if tweet_author and not args.author:
             args.author = tweet_author
             log_info(f"Extracted author from tweet: {tweet_author}")
+    elif args.facebook:
+        title, cleaned, post_time, post_author = clean_facebook_html(html_input)
+        log_info("Extracted Facebook post content.")
+        if post_time and not args.published_at:
+            args.published_at = post_time
+        if post_author and not args.author:
+            args.author = post_author
+            log_info(f"Extracted author from Facebook post: {post_author}")
     elif args.clean:
         title, cleaned = clean_html_with_readability(html_input)
         log_info("Extracted readable content.")
@@ -594,11 +652,19 @@ def main():
     token = oauth_token_password_grant(base_url, client_id, client_secret, username, password)
     log_debug("Obtained access token.")
 
-    # Get LLM tags if available
+    # Get LLM tags if available; also generate headline for twitter mode
     llm_tag_csv = None
+    llm_title = None
     try:
         allowed = [t.get("label") for t in get_all_tags(base_url, token) if t.get("label")]
         plain_text = html_to_text(cleaned)
+        if (args.twitter or args.facebook) and not args.title:
+            try:
+                llm_title = generate_twitter_headline_with_llm(config, plain_text)
+                if llm_title:
+                    log_info(f"LLM-generated headline: {llm_title}")
+            except Exception as e:
+                log_warning(f"Could not generate LLM headline: {e}")
         if llm_provider == "ollama":
             existing_tags, _proposed = choose_tags_with_ollama(ollama_url, ollama_model, plain_text, allowed, max_tags=6, tag_notes=tag_notes, api_key=ollama_api_key)
         else:
@@ -627,6 +693,8 @@ def main():
         data = {"content": cleaned}
         if args.title:
             data["title"] = args.title
+        elif llm_title:
+            data["title"] = llm_title
         if tags_to_send:
             data["tags"] = tags_to_send
         if args.published_at:
@@ -643,7 +711,7 @@ def main():
         if args.title:
             data["title"] = args.title
         else:
-            data["title"] = title or "Untitled"
+            data["title"] = llm_title or title or "Untitled"
         if tags_to_send:
             data["tags"] = tags_to_send
         if args.published_at:
@@ -752,6 +820,298 @@ def normalize_published_at(value, tz=None):
     return value
 
 
+def _try_extract_json_at_pos(text, start):
+    """Extract a balanced JSON object from text starting at position start (must be '{').
+    Returns parsed dict/list or None."""
+    if start >= len(text) or text[start] != '{':
+        return None
+    depth = 0
+    in_string = False
+    i = start
+    while i < len(text):
+        c = text[i]
+        if in_string:
+            if c == '\\':
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+        else:
+            if c == '"':
+                in_string = True
+            elif c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except (json.JSONDecodeError, ValueError):
+                        return None
+        i += 1
+    return None
+
+
+def _extract_json_objects_from_script(text):
+    """Extract JSON objects from a script tag's text content.
+
+    Strategy 1: treat entire text as JSON (covers application/ld+json).
+    Strategy 2: find '= {' assignment patterns and parse the value.
+    Returns list of parsed dicts.
+    """
+    results = []
+    seen_starts = set()
+
+    # Strategy 1: whole text
+    stripped = text.strip()
+    if stripped.startswith('{') or stripped.startswith('['):
+        try:
+            obj = json.loads(stripped)
+            if isinstance(obj, dict):
+                results.append(obj)
+            elif isinstance(obj, list):
+                results.extend(o for o in obj if isinstance(o, dict))
+            return results  # Clean JSON — no need to dig further
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Strategy 2: variable assignments  var x = {...};
+    for m in re.finditer(r'=\s*(\{)', text):
+        start = m.start(1)
+        if start in seen_starts:
+            continue
+        seen_starts.add(start)
+        obj = _try_extract_json_at_pos(text, start)
+        if isinstance(obj, dict):
+            results.append(obj)
+
+    return results
+
+
+def _find_key_in_obj(obj, key, depth=0):
+    """Recursively search a nested dict/list for the first occurrence of key."""
+    if depth > 8:
+        return None
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            result = _find_key_in_obj(v, key, depth + 1)
+            if result is not None:
+                return result
+    elif isinstance(obj, list):
+        for item in obj:
+            result = _find_key_in_obj(item, key, depth + 1)
+            if result is not None:
+                return result
+    return None
+
+
+def _epoch_to_iso(val):
+    """Convert an epoch timestamp (seconds or milliseconds) to ISO 8601 string (UTC).
+    Returns None if val is not a recognisable epoch."""
+    try:
+        ts = int(val)
+    except (ValueError, TypeError):
+        return None
+    # Detect milliseconds vs seconds
+    if ts > 1_000_000_000_000:
+        ts = ts / 1000
+    # Sanity: must fall between 2000-01-01 and 2100-01-01
+    if not (946_684_800 <= ts <= 4_102_444_800):
+        return None
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+    except (ValueError, OSError):
+        return None
+
+
+def _parse_date_string_to_iso(val):
+    """Parse a date string to ISO 8601.  Handles ISO 8601 and bare YYYY-MM-DD."""
+    if not isinstance(val, str):
+        return None
+    val = val.strip()
+    # Bare date YYYY-MM-DD → midnight UTC (check before fromisoformat, which returns naive datetime)
+    if re.fullmatch(r'\d{4}-\d{2}-\d{2}', val):
+        return val + 'T00:00:00+00:00'
+    # ISO 8601 (with or without timezone)
+    try:
+        return datetime.fromisoformat(val.replace('Z', '+00:00')).isoformat()
+    except ValueError:
+        pass
+    return None
+
+
+# Priority groups for JSON date extraction: (label, epoch_keys, date_string_keys)
+# Searched in order; within each group epoch keys are tried before date string keys.
+_JSON_DATE_PRIORITY = [
+    (
+        'published',
+        ['time_published'],
+        ['date_published', 'datePublished', 'publishedAt', 'published_at'],
+    ),
+    (
+        'updated',
+        ['time_updated'],
+        ['date_updated', 'dateModified', 'updatedAt', 'updated_at'],
+    ),
+    (
+        'created',
+        ['time_created'],
+        ['date_created', 'dateCreated', 'createdAt', 'created_at'],
+    ),
+]
+
+
+def extract_date_from_json_scripts(html_input):
+    """Search <script> tags for JSON data containing timestamp fields.
+
+    Returns an ISO 8601 string (UTC) if a date is found, or None.
+    Priority: published > updated > created; epoch timestamps > date strings.
+    """
+    from lxml import html as lxml_html
+
+    try:
+        doc = lxml_html.fromstring(html_input)
+    except Exception:
+        return None
+
+    json_objects = []
+    for script in doc.xpath('//script'):
+        text = script.text or ''
+        if not text.strip():
+            continue
+        json_objects.extend(_extract_json_objects_from_script(text))
+
+    if not json_objects:
+        return None
+
+    for label, epoch_keys, date_keys in _JSON_DATE_PRIORITY:
+        # Prefer epoch timestamps (more granular)
+        for key in epoch_keys:
+            for obj in json_objects:
+                val = _find_key_in_obj(obj, key)
+                if val is not None:
+                    iso = _epoch_to_iso(val)
+                    if iso:
+                        log_debug(f"Extracted {label} date from JSON key '{key}': {iso}")
+                        return iso
+        # Fall back to date strings
+        for key in date_keys:
+            for obj in json_objects:
+                val = _find_key_in_obj(obj, key)
+                if val is not None:
+                    iso = _parse_date_string_to_iso(val)
+                    if iso:
+                        log_debug(f"Extracted {label} date from JSON key '{key}': {iso}")
+                        return iso
+
+    return None
+
+
+# Attribute priority for <article> tag date extraction: (label, attr_names)
+_ARTICLE_DATE_PRIORITY = [
+    ('published',  ['data-published', 'data-published-at', 'data-publish-date', 'data-publish-time', 'data-publication-date']),
+    ('updated',    ['data-last-updated', 'data-updated', 'data-updated-at', 'data-update-date', 'data-modified', 'data-last-modified']),
+    ('created',    ['data-created', 'data-created-at', 'data-create-date']),
+]
+
+
+def _parse_rfc2822_or_iso(val):
+    """Parse an RFC 2822 date (e.g. 'Mon, 02 Mar 2026 00:53:31 GMT') or ISO 8601 string.
+    Returns ISO 8601 string or None."""
+    if not isinstance(val, str):
+        return None
+    val = val.strip()
+    # Try RFC 2822 (handles HTTP-date and email Date headers)
+    try:
+        import email.utils
+        dt = email.utils.parsedate_to_datetime(val)
+        return dt.isoformat()
+    except Exception:
+        pass
+    # Fall back to ISO / bare date handling
+    return _parse_date_string_to_iso(val)
+
+
+def extract_date_from_article_tag(html_input):
+    """Search <article> tag attributes for date/time metadata.
+
+    Returns an ISO 8601 string if found, or None.
+    Priority: published > updated > created.
+    """
+    from lxml import html as lxml_html
+
+    try:
+        doc = lxml_html.fromstring(html_input)
+    except Exception:
+        return None
+
+    articles = doc.xpath('//article')
+    if not articles:
+        return None
+
+    for label, attr_names in _ARTICLE_DATE_PRIORITY:
+        for attr in attr_names:
+            for article in articles:
+                val = article.get(attr)
+                if val:
+                    iso = _parse_rfc2822_or_iso(val)
+                    if iso:
+                        log_debug(f"Extracted {label} date from <article> attribute '{attr}': {iso}")
+                        return iso
+
+    return None
+
+
+def extract_date_from_time_element(html_input):
+    """Search for <time datetime="..."> elements containing a publication date.
+
+    Prefers elements inside <header> or with publication-related class names,
+    then falls back to any <time datetime> in the document.
+
+    Returns an ISO 8601 string if found, or None.
+    """
+    from lxml import html as lxml_html
+
+    try:
+        doc = lxml_html.fromstring(html_input)
+    except Exception:
+        return None
+
+    # Prefer <time> elements that look like article publish timestamps:
+    # inside <header>, or whose class name contains publication-related terms.
+    pub_classes = ('pubdate', 'publish', 'published', 'date', 'timestamp', 'post-date')
+    candidates = []
+    for el in doc.xpath('//time[@datetime]'):
+        dt_val = el.get('datetime', '').strip()
+        if not dt_val:
+            continue
+        cls = (el.get('class') or '').lower()
+        # Score: higher = more likely to be a publish date
+        score = 0
+        if any(term in cls for term in pub_classes):
+            score += 2
+        # Inside a <header> element?
+        parent = el.getparent()
+        while parent is not None:
+            if parent.tag == 'header':
+                score += 1
+                break
+            parent = parent.getparent()
+        candidates.append((score, dt_val))
+
+    # Sort by score descending, try each until one parses
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    for score, dt_val in candidates:
+        iso = _parse_date_string_to_iso(dt_val)
+        if iso:
+            log_debug(f"Extracted date from <time datetime> element: {iso}")
+            return iso
+
+    return None
+
+
 ######################################
 # URL Utilities
 ######################################
@@ -850,28 +1210,32 @@ def get_last_entry(base_url, token):
     return None
 
 
-def get_untagged_entries(base_url, token, detail="metadata"):
+def get_untagged_entries(base_url, token, detail="metadata", exhaustive=False):
     """Fetch all entries that have no tags.
 
-    Paginates through all entries and filters client-side since the
+    Paginates through entries (newest first) and filters client-side since the
     Wallabag API has no server-side filter for untagged entries.
 
     Args:
         base_url: Wallabag instance base URL.
         token: OAuth access token.
         detail: "metadata" for lightweight listing, "full" to include HTML content.
+        exhaustive: If False (default), stop after 20 consecutive tagged entries.
 
     Returns:
         List of entry dicts with zero tags.
     """
+    CONSECUTIVE_TAGGED_THRESHOLD = 20
+
     url = f"{base_url}/api/entries.json"
     headers = {"Authorization": f"Bearer {token}"}
     per_page = 30
     page = 1
     results = []
+    consecutive_tagged = 0
 
     # First request to discover total pages
-    params = {"perPage": per_page, "page": page, "detail": detail}
+    params = {"perPage": per_page, "page": page, "detail": detail, "sort": "created", "order": "desc"}
     resp = requests.get(url, headers=headers, params=params, timeout=30)
     resp.raise_for_status()
     body = resp.json()
@@ -881,7 +1245,7 @@ def get_untagged_entries(base_url, token, detail="metadata"):
 
     while True:
         if page > 1:
-            params = {"perPage": per_page, "page": page, "detail": detail}
+            params = {"perPage": per_page, "page": page, "detail": detail, "sort": "created", "order": "desc"}
             resp = requests.get(url, headers=headers, params=params, timeout=30)
             resp.raise_for_status()
             body = resp.json()
@@ -890,8 +1254,15 @@ def get_untagged_entries(base_url, token, detail="metadata"):
         for entry in items:
             if not entry.get("tags", []):
                 results.append(entry)
+                consecutive_tagged = 0
+            else:
+                consecutive_tagged += 1
 
-        print(f"  Scanned page {page}/{total_pages}...", file=sys.stderr)
+        print(f"  Scanned page {page}/{total_pages}, {len(results)} untagged so far...", file=sys.stderr)
+
+        if not exhaustive and consecutive_tagged >= CONSECUTIVE_TAGGED_THRESHOLD:
+            log_info(f"Stopping early: {consecutive_tagged} consecutive tagged entries seen.")
+            break
 
         if page >= total_pages:
             break
@@ -959,24 +1330,99 @@ def clean_html_with_readability(html_input):
     return title, cleaned
 
 
+def _extract_author_from_user_name_div(user_name_div):
+    """Extract display name and handle from a single User-Name element.
+
+    Handles both main-tweet format (display name/handle in <a> tags) and
+    quoted-tweet format (display name/handle in <div> tags with no links).
+    Scans spans for text: first non-@ text = display name, first @-prefixed = handle.
+    """
+    display_name = None
+    handle = None
+    for span in user_name_div.xpath('.//span[not(ancestor::svg)]'):
+        text = span.text_content().strip()
+        if not text:
+            continue
+        if text.startswith('@') and handle is None:
+            handle = text
+        elif not text.startswith('@') and display_name is None:
+            display_name = text
+        if display_name and handle:
+            break
+    if display_name and handle:
+        return f"{display_name} ({handle})"
+    return display_name or handle
+
+
+def _extract_handle_from_article(article):
+    """Get tweet author's handle from UserAvatar-Container-{handle} data-testid in an article."""
+    avatars = article.xpath('.//*[starts-with(@data-testid, "UserAvatar-Container-")]')
+    if not avatars:
+        return None
+    testid = avatars[0].get('data-testid', '')
+    prefix = 'UserAvatar-Container-'
+    return testid[len(prefix):] if testid.startswith(prefix) else None
+
+
 def _extract_twitter_author(doc):
     """Extract the tweet author's display name and handle from a parsed Twitter/X document."""
     user_name_divs = doc.xpath('//*[@data-testid="User-Name"]')
     if not user_name_divs:
         return None
-    user_name_div = user_name_divs[0]
+    return _extract_author_from_user_name_div(user_name_divs[0])
 
-    # Display name: first <a role="link"> without tabindex
-    display_links = user_name_div.xpath('.//a[@role="link" and not(@tabindex)]')
-    display_name = display_links[0].text_content().strip() if display_links else None
 
-    # Handle: <a> with tabindex="-1"
-    handle_links = user_name_div.xpath('.//a[@tabindex="-1"]')
-    handle = handle_links[0].text_content().strip() if handle_links else None
+def _extract_article_card(article):
+    """Extract linked article URL and headline from a tweet's card preview, if present.
 
-    if display_name and handle:
-        return f"{display_name} ({handle})"
-    return display_name or handle
+    Returns (url, headline) tuple, or (None, None) if no card found.
+    """
+    cards = article.xpath('.//*[@data-testid="card.wrapper"]')
+    if not cards:
+        return None, None
+    card = cards[0]
+    anchors = card.xpath('.//a[@role="link"]')
+    if not anchors:
+        return None, None
+    anchor = anchors[0]
+    url = anchor.get('href', '').strip() or None
+    # Primary: parse headline from aria-label "domain.com Headline text"
+    headline = None
+    aria = anchor.get('aria-label', '')
+    parts = aria.split(' ', 1)
+    if len(parts) == 2 and parts[1].strip():
+        headline = parts[1].strip()
+    # Fallback: first non-empty innermost span text
+    if not headline:
+        for span in anchor.xpath('.//span[not(ancestor::svg)][not(.//span)]'):
+            text = span.text_content().strip()
+            if text:
+                headline = text
+                break
+    return url, headline
+
+
+def _strip_twitter_noise(doc):
+    """Remove Twitter UI chrome from a parsed lxml document in-place.
+
+    Strips action buttons, view count/analytics link, 'View quotes' link,
+    timestamp anchor, article card wrappers, and sidebar buttons.
+    Ensures the readability fallback path produces clean HTML.
+    """
+    noise_xpaths = [
+        '//*[@role="group"]',               # action button group (likes/reposts/replies)
+        '//a[contains(@href, "/analytics")]',  # view count / analytics link
+        '//a[contains(@href, "/quotes")]',     # "View quotes" link
+        '//a[.//time]',                        # timestamp anchor
+        '//*[@data-testid="card.wrapper"]',    # article card (extracted as annotation)
+        '//button[@aria-label="Grok actions"]',
+        '//button[@data-testid="caret"]',      # "More" menu button
+    ]
+    for xpath in noise_xpaths:
+        for el in doc.xpath(xpath):
+            parent = el.getparent()
+            if parent is not None:
+                parent.remove(el)
 
 
 def _extract_twitter_title(doc):
@@ -1007,16 +1453,14 @@ def clean_twitter_html(html_input):
 
     if not tweet_divs:
         log_warning("No tweetText elements found in HTML; falling back to readability")
-        title, cleaned = clean_html_with_readability(html_input)
+        _strip_twitter_noise(doc)
+        title, cleaned = clean_html_with_readability(lxml_html.tostring(doc, encoding='unicode'))
         return title, cleaned, None, None
 
-    output_parts = []
-    for i, tweet_div in enumerate(tweet_divs):
-        if i > 0:
-            output_parts.append('<hr>')
+    def _build_para_parts(tweet_div):
         tweet_text = tweet_div.text_content()
-        # Split on double newlines (paragraph breaks Twitter uses instead of <p>)
         paragraphs = re.split(r'\n\n+', tweet_text)
+        parts = []
         for para in paragraphs:
             para = para.strip()
             if not para:
@@ -1024,11 +1468,107 @@ def clean_twitter_html(html_input):
             # Convert remaining single newlines to <br>
             lines = [html_module.escape(line.strip()) for line in para.split('\n') if line.strip()]
             if lines:
-                output_parts.append(f'<p>{"<br>".join(lines)}</p>')
+                parts.append(f'<p>{"<br>".join(lines)}</p>')
+        return parts
+
+    output_parts = []
+
+    # Try article-based processing to detect threads.
+    # A thread is the initial run of consecutive articles by the same author.
+    articles = doc.xpath('//article[@data-testid="tweet"]')
+    if articles:
+        first_handle = _extract_handle_from_article(articles[0])
+        thread_articles = []
+        for article in articles:
+            if first_handle and _extract_handle_from_article(article) == first_handle:
+                thread_articles.append(article)
+            else:
+                break
+
+        # Detect if page was saved mid-scroll (early posts may be missing).
+        # Twitter virtualizes off-screen content; if the first thread article
+        # starts far down the page, posts above the saved viewport are gone.
+        if thread_articles:
+            parent_cells = thread_articles[0].xpath(
+                'ancestor::*[@data-testid="cellInnerDiv"]'
+            )
+            if parent_cells:
+                cell_style = parent_cells[0].get('style', '')
+                m = re.search(r'translateY\(([0-9.]+)px\)', cell_style)
+                if m and float(m.group(1)) > 500:
+                    log_warning(
+                        "Twitter thread appears to start mid-page — earlier posts may be "
+                        "missing. To capture the full thread, scroll to the top before "
+                        "saving the HTML."
+                    )
+
+        for article_idx, article in enumerate(thread_articles):
+            tweet_texts = article.xpath('.//*[@data-testid="tweetText"]')
+            user_names = article.xpath('.//*[@data-testid="User-Name"]')
+            if not tweet_texts:
+                continue
+            if article_idx > 0:
+                output_parts.append('<hr>')
+            for j, tweet_div in enumerate(tweet_texts):
+                para_parts = _build_para_parts(tweet_div)
+                if j == 0:
+                    output_parts.extend(para_parts)
+                else:
+                    output_parts.append('<hr>')
+                    quoted_author = _extract_author_from_user_name_div(user_names[j]) if j < len(user_names) else None
+                    header = f'<p><strong>Quoting {quoted_author}</strong></p>' if quoted_author else '<p><strong>Quoted tweet</strong></p>'
+                    output_parts.append(header)
+                    output_parts.append('<blockquote>')
+                    output_parts.extend(para_parts)
+                    output_parts.append('</blockquote>')
+            card_url, card_headline = _extract_article_card(article)
+            if card_url:
+                link_text = html_module.escape(card_headline) if card_headline else html_module.escape(card_url)
+                output_parts.append(f'<p><em>Linking to: <a href="{html_module.escape(card_url)}">{link_text}</a></em></p>')
+
+    # Fallback: flat processing (original behavior, for HTML without article elements)
+    if not output_parts:
+        user_name_divs = doc.xpath('//*[@data-testid="User-Name"]')
+        for i, tweet_div in enumerate(tweet_divs):
+            para_parts = _build_para_parts(tweet_div)
+            if i == 0:
+                output_parts.extend(para_parts)
+            else:
+                output_parts.append('<hr>')
+                quoted_author = _extract_author_from_user_name_div(user_name_divs[i]) if i < len(user_name_divs) else None
+                header = f'<p><strong>Quoting {quoted_author}</strong></p>' if quoted_author else '<p><strong>Quoted tweet</strong></p>'
+                output_parts.append(header)
+                output_parts.append('<blockquote>')
+                output_parts.extend(para_parts)
+                output_parts.append('</blockquote>')
+        # Card annotation for flat-processing path (no article elements)
+        card_divs = doc.xpath('//*[@data-testid="card.wrapper"]')
+        for card in card_divs:
+            anchors = card.xpath('.//a[@role="link"]')
+            if not anchors:
+                continue
+            anchor = anchors[0]
+            card_url = anchor.get('href', '').strip() or None
+            if not card_url:
+                continue
+            card_headline = None
+            aria = anchor.get('aria-label', '')
+            parts = aria.split(' ', 1)
+            if len(parts) == 2 and parts[1].strip():
+                card_headline = parts[1].strip()
+            if not card_headline:
+                for span in anchor.xpath('.//span[not(ancestor::svg)][not(.//span)]'):
+                    text = span.text_content().strip()
+                    if text:
+                        card_headline = text
+                        break
+            link_text = html_module.escape(card_headline) if card_headline else html_module.escape(card_url)
+            output_parts.append(f'<p><em>Linking to: <a href="{html_module.escape(card_url)}">{link_text}</a></em></p>')
 
     if not output_parts:
         log_warning("No tweet content extracted; falling back to readability")
-        title, cleaned = clean_html_with_readability(html_input)
+        _strip_twitter_noise(doc)
+        title, cleaned = clean_html_with_readability(lxml_html.tostring(doc, encoding='unicode'))
         return title, cleaned, None, None
 
     title = _extract_twitter_title(doc)
@@ -1042,6 +1582,246 @@ def clean_twitter_html(html_input):
     tweet_author = _extract_twitter_author(doc)
 
     return title, '\n'.join(output_parts), tweet_time, tweet_author
+
+
+def clean_facebook_html(html_input):
+    """Extract post content from a Facebook single-post page saved as HTML.
+
+    Facebook pages are large app bundles with no semantic data-testid markers.
+    This function finds the main post dialog, extracts the author and post text,
+    and optionally wraps any shared article/post in a blockquote.
+    Falls back to readability if the expected structure isn't found.
+    """
+    from lxml import html as lxml_html
+
+    doc = lxml_html.fromstring(html_input)
+
+    title_tags = doc.xpath('//title/text()')
+    page_title = title_tags[0] if title_tags else ''
+    author = _extract_fb_author_from_title(page_title)
+
+    dialogs = doc.xpath('//div[@role="dialog"]')
+    if not dialogs:
+        log_warning("No dialog elements found in Facebook HTML; falling back to readability")
+        title, cleaned = clean_html_with_readability(html_input)
+        return title, cleaned, None, author
+
+    main_dialog = _find_fb_main_dialog(dialogs)
+
+    author_link = _find_fb_author_link(main_dialog, author)
+    if author_link is None:
+        log_warning("Could not find author link in Facebook HTML; falling back to readability")
+        title, cleaned = clean_html_with_readability(html_input)
+        return title, cleaned, None, author
+
+    if author is None:
+        author = author_link.text_content().strip() or None
+
+    post_content_node = _find_fb_post_content(author_link)
+    if post_content_node is None:
+        log_warning("Could not find post content in Facebook HTML; falling back to readability")
+        title, cleaned = clean_html_with_readability(html_input)
+        return title, cleaned, None, author
+
+    content_children = [e for e in post_content_node
+                        if hasattr(e, 'tag') and not callable(e.tag)]
+
+    if not content_children:
+        main_text_node = post_content_node
+        shared_card_node = None
+    elif len(content_children) == 1:
+        main_text_node = content_children[0]
+        shared_card_node = None
+    else:
+        main_text_node = content_children[0]
+        candidate = content_children[1]
+        shared_card_node = candidate if len(candidate.text_content().strip()) > 50 else None
+
+    output_parts = []
+
+    # Facebook renders each paragraph as a leaf <div dir="auto" style="..."> element.
+    # text_content() flattens them all together; instead, collect each leaf div's text
+    # as its own paragraph to preserve breaks.
+    para_divs = main_text_node.xpath('.//div[@dir][@style]')
+    leaf_para_divs = [d for d in para_divs if not d.xpath('.//div[@dir][@style]')]
+
+    if leaf_para_divs:
+        for d in leaf_para_divs:
+            text = d.text_content().strip()
+            if text:
+                output_parts.append(f'<p>{html_module.escape(text)}</p>')
+    else:
+        # Fallback: use text_content with newline splitting
+        main_text = main_text_node.text_content().strip()
+        if main_text:
+            paragraphs = re.split(r'\n\n+', main_text)
+            for para in paragraphs:
+                para = para.strip()
+                if not para:
+                    continue
+                lines = [html_module.escape(l.strip()) for l in para.split('\n') if l.strip()]
+                if lines:
+                    output_parts.append(f'<p>{"<br>".join(lines)}</p>')
+
+    if shared_card_node is not None:
+        source_name, article_text = _extract_fb_shared_card(shared_card_node)
+        if article_text:
+            output_parts.append('<hr>')
+            label = f'Shared: {source_name}' if source_name else 'Shared content'
+            output_parts.append(f'<p><strong>{html_module.escape(label)}</strong></p>')
+            output_parts.append('<blockquote>')
+            for para in re.split(r'\n\n+', article_text):
+                para = para.strip()
+                if para:
+                    output_parts.append(f'<p>{html_module.escape(para)}</p>')
+            output_parts.append('</blockquote>')
+
+    if not output_parts:
+        log_warning("No Facebook post content extracted; falling back to readability")
+        title, cleaned = clean_html_with_readability(html_input)
+        return title, cleaned, None, author
+
+    post_time = _extract_fb_creation_time(html_input, author_link)
+
+    title = _clean_fb_page_title(page_title)
+    return title, '\n'.join(output_parts), post_time, author
+
+
+def _extract_fb_creation_time(html_input, author_link):
+    """Extract post creation time from embedded JSON in Facebook HTML.
+
+    Finds a "story":{"creation_time":...,"url":".../{slug}/..."} block whose URL
+    matches the author's profile slug, then converts the unix epoch to ISO 8601.
+    """
+    from urllib.parse import urlparse
+    from datetime import datetime, timezone
+
+    href = author_link.get('href', '')
+    slug = urlparse(href).path.strip('/')
+    if not slug:
+        return None
+
+    # JSON encodes slashes as \/, match one literal backslash then slash via \\/
+    pattern = (
+        r'"story":\{"creation_time":(\d+),"url":"https:\\/\\/www\.facebook\.com\\/'
+        + re.escape(slug) + r'\\/'
+    )
+    m = re.search(pattern, html_input)
+    if not m:
+        return None
+
+    ts = int(m.group(1))
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _find_fb_main_dialog(dialogs):
+    """Find the main post dialog, skipping the notifications panel."""
+    for d in dialogs:
+        if not d.text_content().strip().startswith('Notifications'):
+            return d
+    return dialogs[0]
+
+
+def _extract_fb_author_from_title(title):
+    """Extract author name from Facebook page title.
+
+    Handles formats:
+      "(2) Tyler Huckabee - snippet... | Facebook"
+      "Tyler Huckabee - snippet... | Facebook"
+    """
+    m = re.match(r'^\(\d+\)\s+(.+?)\s+-\s+', title)
+    if m:
+        return m.group(1)
+    m = re.match(r'^(.+?)\s+-\s+', title)
+    if m:
+        candidate = m.group(1)
+        if candidate and len(candidate) < 100 and 'facebook.com' not in candidate.lower():
+            return candidate
+    return None
+
+
+def _clean_fb_page_title(title):
+    """Remove Facebook chrome from page title to get a usable post title."""
+    title = re.sub(r'^\(\d+\)\s+', '', title)
+    title = re.sub(r'\s*\|\s*Facebook\s*$', '', title)
+    title = re.sub(r'[.\s\u2014\u2013-]+$', '', title)  # strip trailing dots, spaces, dashes
+    return title.strip() or None
+
+
+def _find_fb_author_link(dialog, author_name):
+    """Find the post author's profile link in the dialog (not a comment link)."""
+    for a in dialog.xpath('.//a[@href]'):
+        href = a.get('href', '')
+        text = a.text_content().strip()
+        if 'comment_id' not in href and author_name and text == author_name:
+            return a
+    # Fallback: first non-trivial profile link without comment_id
+    for a in dialog.xpath('.//a[@href]'):
+        href = a.get('href', '')
+        text = a.text_content().strip()
+        if ('comment_id' not in href
+                and 'facebook.com/' in href
+                and len(text) > 1
+                and text not in ('Facebook', 'Like', 'Comment', 'Share', '')
+                and not text.startswith('http')):
+            return a
+    return None
+
+
+def _find_fb_post_content(author_link):
+    """Walk up from the author link to find the post content container.
+
+    The author link lives inside the post header div (author + timestamp).
+    The post content div is the next sibling of that header at some ancestor level.
+    We identify it by having substantial text and no action-bar markers.
+    """
+    parent = author_link
+    for _ in range(30):
+        parent = parent.getparent()
+        if parent is None:
+            break
+        sib = parent.getnext()
+        if sib is not None and not callable(sib.tag):
+            text = sib.text_content()
+            if (len(text) > 200
+                    and 'LikeCommentShare' not in text
+                    and 'All reactions' not in text):
+                return sib
+    return None
+
+
+def _extract_fb_shared_card(card_node):
+    """Extract source name and article text from a Facebook shared content card.
+
+    The card typically has an h4 element containing the source page link,
+    followed by a sibling div with the clean article description text.
+    """
+    source_name = None
+    article_text = None
+
+    h4s = card_node.xpath('.//h4')
+    for h4 in h4s:
+        links = h4.xpath('.//a')
+        if links:
+            source_name = links[0].text_content().strip()
+            break
+
+    # Walk up from h4 until we find a next sibling that looks like article text.
+    # Skip scrambled timestamp divs (they end with "Shared with Public/Friends").
+    if h4s:
+        node = h4s[0]
+        for _ in range(15):
+            sib = node.getnext()
+            if sib is not None and not callable(sib.tag):
+                text = sib.text_content().strip()
+                if len(text) > 50 and 'Shared with' not in text:
+                    article_text = text
+                    break
+            node = node.getparent()
+            if node is None:
+                break
+
+    return source_name, article_text
 
 
 ######################################
@@ -1076,9 +1856,27 @@ IMPORTANT GUIDELINES:
 - Prefer specific tags over vague ones when both apply
 - It's better to select fewer, highly-relevant tags than many loosely-related ones
 - Select 1-4 tags typically; only use more if the article genuinely covers multiple distinct topics in depth
+- STRICT EVIDENCE RULE: Before applying any tag, you must be able to point to specific text in the article that directly supports it. If a tag's subject is not explicitly named or clearly described in the article, do NOT apply that tag — even if you think it might be tangentially related.
+- EVIDENCE REQUIRED IN RESPONSE: For each tag you select, you must include a direct verbatim quote from the article that supports it.
 
 {tag_notes_block}Select tags from the allowed list ("existing").
 Only put non-duplicates into "proposed_new" if a new tag would be clearly valuable and nothing in the allowed list fits."""
+
+
+def _build_headline_system_prompt() -> str:
+    """Build the system prompt for Twitter headline generation."""
+    return (
+        "You are a headline writer for a personal reading archive. "
+        "Given the text of a tweet or Twitter/X post, write a single short, factual, descriptive headline.\n\n"
+        "Rules:\n"
+        "- Output ONLY the headline — no options, no alternatives, no explanation\n"
+        "- Be descriptive and informative, not creative or witty\n"
+        "- Do not use humor, puns, or rhetorical flair\n"
+        "- Keep it concise (typically 6–12 words)\n"
+        "- If the tweet is a quote-tweet responding to another post, describe the top (outer) post; "
+        "you may note who is responding to whom if it is clear, but this is not required\n"
+        "- Do not start with 'Tweet:', 'Post:', or similar prefixes"
+    )
 
 
 def _parse_json_response(text: str) -> dict:
@@ -1138,7 +1936,15 @@ def choose_tags_with_llm(api_key: str, model: str, article_text: str, allowed_ta
         "properties": {
             "existing": {
                 "type": "array",
-                "items": {"type": "string", "enum": allowed_tags},
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tag": {"type": "string", "enum": allowed_tags},
+                        "evidence": {"type": "string", "description": "Direct verbatim quote from the article supporting this tag"}
+                    },
+                    "required": ["tag", "evidence"],
+                    "additionalProperties": False
+                },
                 "maxItems": max_tags
             },
             "proposed_new": {
@@ -1157,6 +1963,7 @@ def choose_tags_with_llm(api_key: str, model: str, article_text: str, allowed_ta
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"Tag the following article:\n\n{article_text[:12000]}"}
         ],
+        "temperature": 0,
         "response_format": {
             "type": "json_schema",
             "json_schema": {
@@ -1168,6 +1975,7 @@ def choose_tags_with_llm(api_key: str, model: str, article_text: str, allowed_ta
     }
 
     log_debug(f"Calling OpenAI API with model: {model}")
+    log_debug(f"Tagging system prompt:\n{system_prompt}")
 
     resp = requests.post(
         "https://api.openai.com/v1/chat/completions",
@@ -1185,7 +1993,13 @@ def choose_tags_with_llm(api_key: str, model: str, article_text: str, allowed_ta
     message = parsed["choices"][0]["message"]
     parsed_json = json.loads(message["content"])
 
-    return parsed_json.get("existing", []), parsed_json.get("proposed_new", [])
+    existing_items = parsed_json.get("existing", [])
+    llm_existing = [item["tag"] for item in existing_items if isinstance(item, dict) and "tag" in item]
+    for item in existing_items:
+        if isinstance(item, dict):
+            log_info(f"  tag={item.get('tag')!r} evidence={item.get('evidence', '')!r}")
+
+    return llm_existing, parsed_json.get("proposed_new", [])
 
 
 def choose_tags_with_ollama(ollama_url: str, model: str, article_text: str, allowed_tags: list[str], max_tags: int = 6, tag_notes: dict | None = None, api_key: str | None = None):
@@ -1199,24 +2013,261 @@ def choose_tags_with_ollama(ollama_url: str, model: str, article_text: str, allo
 Allowed tags: [{tags_list}]
 
 Respond with ONLY valid JSON in this exact format (no other text):
-{{"existing": ["tag1", "tag2"], "proposed_new": ["new_tag"]}}
+{{"existing": [{{"tag": "tag1", "evidence": "direct quote from article"}}, {{"tag": "tag2", "evidence": "direct quote from article"}}], "proposed_new": ["new_tag"]}}
 
-"existing" must only contain tags from the allowed list above (max {max_tags}).
+"existing" must only contain tags from the allowed list above (max {max_tags}), each with a verbatim evidence quote.
 "proposed_new" may contain up to 3 new tags only if nothing in the allowed list fits.
 
 Tag the following article:
 
 {article_text[:12000]}"""
 
+    log_debug(f"Tagging system prompt:\n{system_prompt}")
     response_text = _ollama_request(ollama_url, model, prompt, api_key=api_key)
     parsed = _parse_json_response(response_text)
 
     # Validate existing tags against allowed list
-    existing = [t for t in parsed.get("existing", []) if t in allowed_tags][:max_tags]
+    existing_items = parsed.get("existing", [])
+    existing = [item["tag"] for item in existing_items if isinstance(item, dict) and "tag" in item and item["tag"] in allowed_tags][:max_tags]
+    for item in existing_items:
+        if isinstance(item, dict):
+            log_info(f"  tag={item.get('tag')!r} evidence={item.get('evidence', '')!r}")
     proposed = parsed.get("proposed_new", [])[:3]
 
     return existing, proposed
 
+
+
+def _generate_headline_openai(api_key: str, model: str, tweet_text: str) -> str | None:
+    """Generate a headline for a tweet using the OpenAI chat completions API."""
+    system_prompt = _build_headline_system_prompt()
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "headline": {"type": "string"}
+        },
+        "required": ["headline"],
+        "additionalProperties": False
+    }
+
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Write a headline for this tweet:\n\n{tweet_text[:4000]}"}
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "headline",
+                "schema": schema,
+                "strict": True
+            }
+        }
+    }
+
+    log_debug(f"Calling OpenAI API for headline with model: {model}")
+
+    resp = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json=body,
+        timeout=60,
+    )
+
+    if not resp.ok:
+        log_error(f"OpenAI API error: {resp.status_code}\n{resp.text}")
+
+    resp.raise_for_status()
+    parsed = resp.json()
+    message = parsed["choices"][0]["message"]
+    parsed_json = json.loads(message["content"])
+    return parsed_json.get("headline") or None
+
+
+def _generate_headline_ollama(ollama_url: str, model: str, tweet_text: str, api_key: str | None = None) -> str | None:
+    """Generate a headline for a tweet using the Ollama /api/generate endpoint."""
+    system_prompt = _build_headline_system_prompt()
+
+    prompt = f"""{system_prompt}
+
+Respond with ONLY valid JSON in this exact format (no other text):
+{{"headline": "your headline here"}}
+
+Write a headline for this tweet:
+
+{tweet_text[:4000]}"""
+
+    response_text = _ollama_request(ollama_url, model, prompt, api_key=api_key, num_predict=200)
+    parsed = _parse_json_response(response_text)
+    return parsed.get("headline") or None
+
+
+def generate_twitter_headline_with_llm(config, tweet_text: str) -> str | None:
+    """Generate a descriptive headline for a tweet using the configured LLM provider."""
+    provider = config.get("WALLABAG", "LLM_PROVIDER", fallback="").lower()
+    if provider == "openai":
+        api_key = config["OPENAI"].get("API_KEY", "")
+        if not api_key:
+            return None
+        model = config["OPENAI"].get("TAG_MODEL", "gpt-4o-mini")
+        return _generate_headline_openai(api_key, model, tweet_text)
+    elif provider == "ollama":
+        url = config["OLLAMA"].get("URL", "http://localhost:11434")
+        model = config["OLLAMA"].get("MODEL", "")
+        api_key = config["OLLAMA"].get("API_KEY") or None
+        return _generate_headline_ollama(url, model, tweet_text, api_key=api_key)
+    return None
+
+
+######################################
+# Article HTML Export
+######################################
+def _slugify(text, max_len=60):
+    """Convert text to a filesystem-safe slug."""
+    text = text.lower()
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[\s_-]+", "-", text)
+    text = text.strip("-")
+    return text[:max_len]
+
+
+def render_article_html(entry):
+    """Render a Wallabag entry as a self-contained, mobile-friendly HTML document."""
+    title = entry.get("title") or "Untitled"
+    content = entry.get("content") or ""
+    authors = entry.get("authors") or ""
+    url = entry.get("url") or ""
+    tags = [t["label"] for t in (entry.get("tags") or []) if t.get("label")]
+
+    # Format publication date
+    published_raw = entry.get("published_at") or ""
+    date_display = ""
+    if published_raw:
+        try:
+            dt = datetime.fromisoformat(published_raw.replace("Z", "+00:00"))
+            date_display = dt.strftime("%B %-d, %Y")
+        except (ValueError, AttributeError):
+            date_display = published_raw
+
+    # Build meta line (author · date)
+    meta_parts = []
+    if authors:
+        meta_parts.append(f'<span class="author">{html_module.escape(authors)}</span>')
+    if date_display:
+        meta_parts.append(f'<span class="date">{html_module.escape(date_display)}</span>')
+    meta_html = '<div class="meta">' + "".join(meta_parts) + "</div>" if meta_parts else ""
+
+    # Build tags
+    tags_html = ""
+    if tags:
+        tag_spans = "".join(f'<span class="tag">{html_module.escape(t)}</span>' for t in tags)
+        tags_html = f'<div class="tags">{tag_spans}</div>'
+
+    # Build source link
+    source_html = ""
+    if url:
+        escaped_url = html_module.escape(url)
+        source_html = f'<div class="source"><a href="{escaped_url}">{escaped_url}</a></div>'
+
+    escaped_title = html_module.escape(title)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{escaped_title}</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; }}
+    body {{
+      font-family: Georgia, 'Times New Roman', serif;
+      font-size: 18px;
+      line-height: 1.7;
+      color: #222;
+      background: #fafaf8;
+      margin: 0;
+      padding: 1rem;
+    }}
+    article {{
+      max-width: 720px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+    }}
+    header {{
+      margin-bottom: 2rem;
+      border-bottom: 1px solid #ddd;
+      padding-bottom: 1.25rem;
+    }}
+    h1 {{
+      font-size: 1.8rem;
+      line-height: 1.25;
+      margin: 0 0 0.75rem;
+      color: #111;
+    }}
+    .meta {{
+      font-family: system-ui, sans-serif;
+      font-size: 0.875rem;
+      color: #666;
+    }}
+    .meta span + span::before {{ content: " \00b7 "; }}
+    .tags {{ margin-top: 0.5rem; }}
+    .tag {{
+      display: inline-block;
+      background: #eee;
+      border-radius: 3px;
+      padding: 0.1em 0.5em;
+      font-size: 0.8rem;
+      font-family: system-ui, sans-serif;
+      color: #555;
+      margin: 0.2em 0.2em 0.2em 0;
+    }}
+    .source {{
+      font-family: system-ui, sans-serif;
+      font-size: 0.8rem;
+      margin-top: 0.5rem;
+      word-break: break-all;
+    }}
+    .source a {{ color: #0066cc; }}
+    .content img {{ max-width: 100%; height: auto; }}
+    .content a {{ color: #0066cc; }}
+    .content pre, .content code {{
+      font-size: 0.875rem;
+      background: #f4f4f0;
+      border-radius: 3px;
+      padding: 0.1em 0.3em;
+    }}
+    .content pre {{ padding: 1rem; overflow-x: auto; }}
+    .content pre code {{ background: none; padding: 0; }}
+    .content blockquote {{
+      border-left: 4px solid #ccc;
+      margin-left: 0;
+      padding-left: 1rem;
+      color: #555;
+      font-style: italic;
+    }}
+    @media (max-width: 480px) {{
+      body {{ font-size: 16px; padding: 0.5rem; }}
+      h1 {{ font-size: 1.4rem; }}
+      article {{ margin: 0.5rem auto; }}
+    }}
+  </style>
+</head>
+<body>
+  <article>
+    <header>
+      <h1>{escaped_title}</h1>
+      {meta_html}
+      {tags_html}
+      {source_html}
+    </header>
+    <div class="content">
+      {content}
+    </div>
+  </article>
+</body>
+</html>"""
 
 
 #
