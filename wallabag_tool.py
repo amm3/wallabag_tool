@@ -639,6 +639,13 @@ def main():
         if post_author and not args.author:
             args.author = post_author
             log_info(f"Extracted author from Facebook post: {post_author}")
+    elif _is_nyt_birdkit(html_input):
+        title, cleaned, article_time, article_author = clean_nyt_birdkit_html(html_input)
+        log_info("Auto-detected NYT birdkit interactive article; extracted structured content.")
+        if article_time and not args.published_at:
+            args.published_at = article_time
+        if article_author and not args.author:
+            args.author = article_author
     elif args.clean:
         title, cleaned = clean_html_with_readability(html_input)
         log_info("Extracted readable content.")
@@ -1822,6 +1829,79 @@ def _extract_fb_shared_card(card_node):
                 break
 
     return source_name, article_text
+
+
+def _is_nyt_birdkit(html_input):
+    """Return True if the HTML appears to be an NYT birdkit interactive article."""
+    return 'birdkit-body' in html_input or 'data-birdkit-hydrate' in html_input
+
+
+def clean_nyt_birdkit_html(html_input):
+    """Extract content from an NYT birdkit/Svelte interactive article.
+
+    These articles use custom CSS class names (g-heading, g-byline, g-body-text,
+    item-name, item-subhed, item-blurb, status) rather than semantic HTML.
+    Returns (title, cleaned_html, published_at, author).
+    Falls back to readability if the expected structure isn't found.
+    """
+    import html as html_module
+    from lxml import html as lxml_html
+
+    doc = lxml_html.fromstring(html_input)
+
+    # Title
+    h1s = doc.xpath("//h1[contains(@class,'g-heading')]")
+    title = h1s[0].text_content().strip() if h1s else None
+
+    # Author — strip leading "By "
+    bylines = doc.xpath("//p[contains(@class,'g-byline')]")
+    author = None
+    if bylines:
+        raw = bylines[0].text_content().strip()
+        author = re.sub(r'^By\s+', '', raw) or None
+
+    # Date — from the birdkit timestamp element
+    times = doc.xpath("//time[contains(@class,'g-interactive-timestamp')]/@datetime")
+    published_at = times[0].strip() if times else None
+
+    output_parts = []
+
+    # Intro paragraphs
+    for p in doc.xpath("//p[contains(@class,'g-body-text')]"):
+        text = p.text_content().strip()
+        if text:
+            output_parts.append(f'<p>{html_module.escape(text)}</p>')
+
+    # Sections — only direct-child sections that own a status heading
+    for section in doc.xpath("//section[./div[contains(@class,'status')]]"):
+        status_divs = section.xpath("./div[contains(@class,'status')]")
+        if status_divs:
+            heading = status_divs[0].text_content().strip()
+            if heading:
+                output_parts.append(f'<h2>{html_module.escape(heading)}</h2>')
+
+        for item in section.xpath("./div[contains(@class,'item')]"):
+            name_els = item.xpath(".//div[contains(@class,'item-name')]")
+            subhed_els = item.xpath(".//div[contains(@class,'item-subhed')]")
+            blurb_els = item.xpath(".//div[contains(@class,'item-blurb')]")
+
+            name = name_els[0].text_content().strip() if name_els else ''
+            subhed = subhed_els[0].text_content().strip() if subhed_els else ''
+            blurb = blurb_els[0].text_content().strip() if blurb_els else ''
+
+            if name:
+                output_parts.append(f'<h3>{html_module.escape(name)}</h3>')
+            if subhed:
+                output_parts.append(f'<p><em>{html_module.escape(subhed)}</em></p>')
+            if blurb:
+                output_parts.append(f'<p>{html_module.escape(blurb)}</p>')
+
+    if not output_parts:
+        log_warning("No birdkit content extracted; falling back to readability")
+        fb_title, cleaned = clean_html_with_readability(html_input)
+        return fb_title or title, cleaned, published_at, author
+
+    return title, '\n'.join(output_parts), published_at, author
 
 
 ######################################
