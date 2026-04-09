@@ -1409,6 +1409,21 @@ def _extract_article_card(article):
     return url, headline
 
 
+def _extract_tweet_photos(article):
+    """Return a list of <img> HTML strings for photos attached to a tweet article."""
+    photo_divs = article.xpath('.//*[@data-testid="tweetPhoto"]')
+    imgs = []
+    for div in photo_divs:
+        for img in div.xpath('.//img[@src]'):
+            src = img.get('src', '').strip()
+            if not src:
+                continue
+            src = src.replace('name=small', 'name=large').replace('name=medium', 'name=large')
+            alt = html_module.escape(img.get('alt', '') or '')
+            imgs.append(f'<img src="{html_module.escape(src)}" alt="{alt}" style="max-width:100%;">')
+    return imgs
+
+
 def _strip_twitter_noise(doc):
     """Remove Twitter UI chrome from a parsed lxml document in-place.
 
@@ -1520,6 +1535,7 @@ def clean_twitter_html(html_input):
                 para_parts = _build_para_parts(tweet_div)
                 if j == 0:
                     output_parts.extend(para_parts)
+                    output_parts.extend(_extract_tweet_photos(article))
                 else:
                     output_parts.append('<hr>')
                     quoted_author = _extract_author_from_user_name_div(user_names[j]) if j < len(user_names) else None
@@ -1540,6 +1556,13 @@ def clean_twitter_html(html_input):
             para_parts = _build_para_parts(tweet_div)
             if i == 0:
                 output_parts.extend(para_parts)
+                for div in doc.xpath('//*[@data-testid="tweetPhoto"]'):
+                    for img in div.xpath('.//img[@src]'):
+                        src = img.get('src', '').strip()
+                        if src:
+                            src = src.replace('name=small', 'name=large').replace('name=medium', 'name=large')
+                            alt = html_module.escape(img.get('alt', '') or '')
+                            output_parts.append(f'<img src="{html_module.escape(src)}" alt="{alt}" style="max-width:100%;">')
             else:
                 output_parts.append('<hr>')
                 quoted_author = _extract_author_from_user_name_div(user_name_divs[i]) if i < len(user_name_divs) else None
@@ -1937,6 +1960,7 @@ IMPORTANT GUIDELINES:
 - It's better to select fewer, highly-relevant tags than many loosely-related ones
 - Select 1-4 tags typically; only use more if the article genuinely covers multiple distinct topics in depth
 - STRICT EVIDENCE RULE: Before applying any tag, you must be able to point to specific text in the article that directly supports it. If a tag's subject is not explicitly named or clearly described in the article, do NOT apply that tag — even if you think it might be tangentially related.
+- SUBSTRING RULE: A tag name must appear as a meaningful, standalone reference in the article — not merely as a substring within an unrelated word. For example, do NOT apply "vance" because the word "advanced" appears, "ice" because "service" appears, or "apt" because "chapter" appears.
 - EVIDENCE REQUIRED IN RESPONSE: For each tag you select, you must include a direct verbatim quote from the article that supports it.
 
 {tag_notes_block}Select tags from the allowed list ("existing").
