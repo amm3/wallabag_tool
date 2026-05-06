@@ -89,7 +89,11 @@ def main():
                         help="With --list-untagged/--retag-untagged: scan every page instead of stopping after 20 consecutive tagged entries")
     parser.add_argument("--retag-untagged", action="store_true", default=False,
                         help="Re-run LLM tagging on all entries that have no tags")
-    
+    parser.add_argument("--consolidate-tag", dest="consolidate_tag", metavar="SOURCE",
+                        help="Merge all entries from SOURCE (label or numeric id) into --into TARGET, then delete SOURCE.")
+    parser.add_argument("--into", dest="consolidate_into", metavar="TARGET",
+                        help="Target tag label or numeric id for --consolidate-tag.")
+
     # HTML processing arguments
     parser.add_argument("--clean", action="store_true", default=False,
                         help="Use readability preprocessing to extract article content (default: send raw HTML to Wallabag)")
@@ -97,7 +101,9 @@ def main():
                         help="Clean Twitter/X HTML, preserving paragraph breaks in tweet text (for HTML copied from browser dev tools)")
     parser.add_argument("--facebook", action="store_true", default=False,
                         help="Clean Facebook HTML, extracting post content and author (for HTML saved from browser dev tools)")
-    
+    parser.add_argument("--linkedin", action="store_true", default=False,
+                        help="Clean LinkedIn HTML, extracting post content and author (for HTML saved from browser dev tools)")
+
     args = parser.parse_args()
 
     ######################################
@@ -187,9 +193,81 @@ def main():
         log_debug("Obtained access token.")
         tags = get_all_tags(base_url, token)
         for tag in tags:
-            print("{label}: {nbEntries}".format(**tag))
+            print("{label} (id={id}): {nbEntries}".format(**tag))
         sys.exit(0)
     
+    if args.consolidate_tag or args.consolidate_into:
+        if not args.consolidate_tag:
+            log_fatal("--into requires --consolidate-tag.", exit_code=2)
+        if not args.consolidate_into:
+            log_fatal("--consolidate-tag requires --into.", exit_code=2)
+        token = oauth_token_password_grant(base_url, client_id, client_secret, username, password)
+        log_debug("Obtained access token.")
+        all_tags = get_all_tags(base_url, token)
+
+        def resolve_tag(value, role):
+            if value.isdigit():
+                tag = next((t for t in all_tags if t["id"] == int(value)), None)
+                if tag is None:
+                    log_fatal(f"{role} tag id={value} not found.", exit_code=1)
+                return tag
+            matches = [t for t in all_tags if t["label"] == value]
+            if not matches:
+                log_fatal(f"{role} tag not found: '{value}'", exit_code=1)
+            if len(matches) > 1:
+                lines = "\n".join(f"  id={t['id']}  '{t['label']}': {t['nbEntries']} entries" for t in matches)
+                log_fatal(
+                    f"Multiple tags share the label '{value}'. Specify by id instead:\n{lines}",
+                    exit_code=1,
+                )
+            return matches[0]
+
+        source_tag = resolve_tag(args.consolidate_tag, "Source")
+        target_tag = resolve_tag(args.consolidate_into, "Target")
+        source_label = source_tag["label"]
+        target_label = target_tag["label"]
+        if source_tag["id"] == target_tag["id"]:
+            log_fatal("Source and target are the same tag.", exit_code=2)
+        entries = get_entries_for_tag(base_url, token, source_label)
+        write_out(f"Source tag '{source_label}' (id={source_tag['id']}): {len(entries)} entries")
+        write_out(f"Target tag '{target_label}' (id={target_tag['id']}): {target_tag.get('nbEntries', '?')} entries")
+        if not entries:
+            write_out("Source tag has no entries. Only the tag itself will be deleted.")
+        else:
+            write_out("\nEntries to migrate:")
+            for entry in entries:
+                write_out(f"  id={entry['id']} {entry.get('title', 'Untitled')!r}")
+        answer = input(f"\nMigrate {len(entries)} entries from '{source_label}' to '{target_label}', then delete '{source_label}'? [y/N] ")
+        if answer.strip().lower() != "y":
+            write_out("Aborted.")
+            sys.exit(0)
+        migrated = 0
+        errors = 0
+        for entry in entries:
+            current_tags = [t["label"] for t in entry.get("tags", []) if t.get("label")]
+            new_tags = []
+            seen = set()
+            for label in current_tags:
+                canonical = target_label if label == source_label else label
+                if canonical not in seen:
+                    new_tags.append(canonical)
+                    seen.add(canonical)
+            try:
+                patch_entry(base_url, token, entry["id"], {"tags": ",".join(new_tags)})
+                write_out(f"  Migrated id={entry['id']} tags={new_tags}")
+                migrated += 1
+            except Exception as e:
+                log_error(f"  Failed to update id={entry['id']}: {e}")
+                errors += 1
+        try:
+            delete_tag(base_url, token, source_tag["id"])
+            write_out(f"Deleted tag '{source_label}' (id={source_tag['id']}).")
+        except Exception as e:
+            log_error(f"Failed to delete tag '{source_label}': {e}")
+            write_out("Migration complete but tag deletion failed. You may need to delete it manually.")
+        write_out(f"\nDone. Migrated {migrated}/{len(entries)} entries.{f' {errors} error(s).' if errors else ''}")
+        sys.exit(0)
+
     if args.dump_html:
         if args.id is None:
             log_fatal("--dump-html requires --id to specify which entry to dump.", exit_code=2)
@@ -639,6 +717,14 @@ def main():
         if post_author and not args.author:
             args.author = post_author
             log_info(f"Extracted author from Facebook post: {post_author}")
+    elif args.linkedin:
+        title, cleaned, post_time, post_author = clean_linkedin_html(html_input)
+        log_info("Extracted LinkedIn post content.")
+        if post_time and not args.published_at:
+            args.published_at = post_time
+        if post_author and not args.author:
+            args.author = post_author
+            log_info(f"Extracted author from LinkedIn post: {post_author}")
     elif _is_nyt_birdkit(html_input):
         title, cleaned, article_time, article_author = clean_nyt_birdkit_html(html_input)
         log_info("Auto-detected NYT birdkit interactive article; extracted structured content.")
@@ -665,7 +751,7 @@ def main():
     try:
         allowed = [t.get("label") for t in get_all_tags(base_url, token) if t.get("label")]
         plain_text = html_to_text(cleaned)
-        if (args.twitter or args.facebook) and not args.title:
+        if (args.twitter or args.facebook or args.linkedin) and not args.title:
             try:
                 llm_title = generate_twitter_headline_with_llm(config, plain_text)
                 if llm_title:
@@ -1278,6 +1364,27 @@ def get_untagged_entries(base_url, token, detail="metadata", exhaustive=False):
     return results
 
 
+def get_entries_for_tag(base_url, token, tag_label):
+    """Fetch all entries that have a specific tag label."""
+    url = f"{base_url}/api/entries.json"
+    headers = {"Authorization": f"Bearer {token}"}
+    per_page = 30
+    page = 1
+    results = []
+    while True:
+        params = {"tags": tag_label, "perPage": per_page, "page": page,
+                  "detail": "metadata", "sort": "created", "order": "desc"}
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        body = resp.json()
+        total_pages = body.get("pages", 1)
+        results.extend(body.get("_embedded", {}).get("items", []))
+        if page >= total_pages:
+            break
+        page += 1
+    return results
+
+
 def post_entry(base_url, token, data):
     """Create new entry."""
     url = f"{base_url}/api/entries.json"
@@ -1298,6 +1405,15 @@ def patch_entry(base_url, token, entry_id, data):
         "Content-Type": "application/json"
     }
     resp = requests.patch(url, headers=headers, json=data, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def delete_tag(base_url, token, tag_id):
+    """Delete a tag by its numeric ID."""
+    url = f"{base_url}/api/tags/{tag_id}.json"
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = requests.delete(url, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
@@ -1715,6 +1831,118 @@ def clean_facebook_html(html_input):
 
     title = _clean_fb_page_title(page_title)
     return title, '\n'.join(output_parts), post_time, author
+
+
+def clean_linkedin_html(html_input):
+    """Extract post content from a LinkedIn single-post page saved as HTML.
+
+    LinkedIn pages are large Ember app bundles. This function finds the main
+    post content using update-components-* class markers, extracts the author
+    from the actor meta link's aria-label (ignoring any repost header), and
+    returns the post text as HTML paragraphs. No absolute timestamp is available
+    in saved LinkedIn HTML, so published_at is always returned as None.
+    """
+    from lxml import html as lxml_html
+    import html as html_module
+
+    doc = lxml_html.fromstring(html_input)
+
+    author = _extract_linkedin_author(doc)
+
+    content_el = _find_linkedin_post_content(doc)
+    if content_el is None:
+        log_warning("Could not find LinkedIn post content; falling back to readability")
+        title, cleaned = clean_html_with_readability(html_input)
+        return title, cleaned, None, author
+
+    output_parts = _extract_linkedin_paragraphs(content_el, html_module)
+
+    if not output_parts:
+        log_warning("No LinkedIn post content extracted; falling back to readability")
+        title, cleaned = clean_html_with_readability(html_input)
+        return title, cleaned, None, author
+
+    cleaned = '\n'.join(output_parts)
+    title = author or "LinkedIn Post"
+    return title, cleaned, None, author
+
+
+def _extract_linkedin_author(doc):
+    """Extract post author from a LinkedIn page DOM.
+
+    Reads the aria-label of the actor meta link, which has the form:
+      "View: Keith Mularski Premium • 1st Chief Global Ambassador ..."
+    Strips the "View: " prefix and stops before the LinkedIn badge or first bullet.
+    Falls back to the actor title span text if the aria-label is absent.
+    """
+    # Primary: actor meta link aria-label
+    links = doc.xpath('//*[contains(@class,"update-components-actor__meta-link")]')
+    for link in links:
+        aria = (link.get('aria-label') or '').strip()
+        if aria.startswith('View:'):
+            name = aria[len('View:'):].strip()
+            # Strip LinkedIn badge suffixes like " Premium •" or " Creator •" or just " •"
+            m = re.match(r'^(.+?)(?:\s+(?:Premium|Creator|Open to Work|Hiring)\s*•|\s*•)', name)
+            if m:
+                return m.group(1).strip()
+            # No badge — return everything before the first " • " separator
+            if ' • ' in name:
+                return name.split(' • ')[0].strip()
+            return name
+
+    # Fallback: actor title span
+    titles = doc.xpath('//*[contains(@class,"update-components-actor__title")]')
+    for title_el in titles:
+        parts = [t.strip() for t in title_el.itertext() if t.strip()]
+        if parts:
+            return parts[0]
+
+    return None
+
+
+def _find_linkedin_post_content(doc):
+    """Find the main post commentary element in a LinkedIn page DOM."""
+    els = doc.xpath('//*[contains(@class,"update-components-update-v2__commentary")]')
+    return els[0] if els else None
+
+
+def _extract_linkedin_paragraphs(content_el, html_module):
+    """Convert a LinkedIn post content element to a list of <p> HTML strings.
+
+    LinkedIn renders post text with paragraph breaks represented as consecutive
+    <span><br/></span> elements. We walk the DOM, emitting a newline for each
+    <br> encountered, then split the result on double newlines to produce
+    paragraph-level <p> tags.
+    """
+    # Walk the element tree, collecting text and inserting \n for each <br>
+    def collect_text(el):
+        parts = []
+        if el.text:
+            parts.append(el.text)
+        for child in el:
+            tag = getattr(child, 'tag', None)
+            if tag == 'br':
+                parts.append('\n')
+            else:
+                parts.extend(collect_text(child))
+            if child.tail:
+                parts.append(child.tail)
+        return parts
+
+    raw = ''.join(collect_text(content_el)).strip()
+    if not raw:
+        return []
+
+    output_parts = []
+    paragraphs = re.split(r'\n\n+', raw)
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        lines = [html_module.escape(l.strip()) for l in para.split('\n') if l.strip()]
+        if lines:
+            output_parts.append(f'<p>{"<br>".join(lines)}</p>')
+    return output_parts
 
 
 def _extract_fb_creation_time(html_input, author_link):
