@@ -699,6 +699,11 @@ def main():
             args.published_at = time_date
             log_info(f"Extracted published_at from <time datetime> element: {time_date}")
 
+    # Rewrite archive.is URLs before mode-specific cleaning
+    html_input, _is_archive = rewrite_archive_is_urls(html_input)
+    if _is_archive:
+        log_info("Detected archive.is HTML; rewrote image URLs and stripped archive link wrappers.")
+
     # Clean HTML based on selected mode
     if args.twitter:
         title, cleaned, tweet_time, tweet_author = clean_twitter_html(html_input)
@@ -1445,6 +1450,38 @@ def extract_title_from_html(html_input):
         return "Untitled"
 
 
+def rewrite_archive_is_urls(html_str):
+    """Detect archive.is/archive.ph HTML and fix two URL problems in-place.
+
+    1. Relative image src="/ARCHIVE_ID/..." → "https://archive.DOMAIN/ARCHIVE_ID/..."
+    2. Proxied href="https://archive.DOMAIN/o/ARCHIVE_ID/https://example.com" → "https://example.com"
+
+    Returns (rewritten_html, was_detected).
+    """
+    wrapper_re = re.compile(r'https?://(archive\.(?:is|ph|today))/o/([A-Za-z0-9]+)/')
+    match = wrapper_re.search(html_str)
+    if not match:
+        return html_str, False
+
+    archive_domain = match.group(1)
+    archive_id = match.group(2)
+    archive_base = f"https://{archive_domain}"
+
+    html_str = re.sub(
+        rf'(src=(?:\'|"))/{re.escape(archive_id)}/([^\'"]+)((?:\'|"))',
+        rf'\1{archive_base}/{archive_id}/\2\3',
+        html_str,
+    )
+
+    html_str = re.sub(
+        rf'(href=(?:\'|")){re.escape(archive_base)}/o/{re.escape(archive_id)}/(https?://[^\'"]+)((?:\'|"))',
+        r'\1\2\3',
+        html_str,
+    )
+
+    return html_str, True
+
+
 def clean_html_with_readability(html_input):
     """Extract readable content using readability-lxml."""
     doc = Document(html_input)
@@ -2169,6 +2206,48 @@ def html_to_text(html_content: str) -> str:
     return text.strip()
 
 
+def _validate_tag_against_article(tag: str, evidence: str, article_text: str) -> bool:
+    """Guard against LLM tag hallucinations.
+
+    For tags whose name contains words ≥5 chars (real words, not abbreviations),
+    ALL such words must appear as whole words in the article text.  This is the
+    primary check and is evaluated before anything else, because the LLM can
+    hallucinate a tag while still citing a real (but unrelated) quote from the
+    article — so evidence-presence alone is not sufficient.
+
+    For abbreviation/short tags (all words <5 chars, e.g. "ai", "ice", "nato"),
+    we fall back to checking that the evidence quote appears verbatim in the
+    article text.  If neither check applies, the tag passes by default.
+    """
+    text_lower = re.sub(r'\s+', ' ', article_text.lower())
+
+    parts = re.split(r'[\s\-]+', tag.lower())
+    key_words = [p for p in parts if len(p) >= 5]
+
+    if key_words:
+        if all(re.search(r'\b' + re.escape(kw) + r'\b', text_lower) for kw in key_words):
+            return True
+        log_warning(
+            f"Dropping tag '{tag}': key word(s) {key_words} absent as whole words "
+            f"in article. Evidence was: {evidence!r}"
+        )
+        return False
+
+    # Abbreviation/short tag — verify evidence appears in article
+    if evidence:
+        ev = re.sub(r'\s+', ' ', evidence.strip().lower())
+        if ev in text_lower:
+            return True
+        words = ev.split()
+        window = 6
+        if len(words) >= window:
+            for i in range(len(words) - window + 1):
+                if ' '.join(words[i:i + window]) in text_lower:
+                    return True
+
+    return True
+
+
 def _build_tagging_system_prompt(tag_notes: dict | None = None) -> str:
     """Build the system prompt used by both OpenAI and Ollama tagging."""
     tag_notes_block = ""
@@ -2326,10 +2405,15 @@ def choose_tags_with_llm(api_key: str, model: str, article_text: str, allowed_ta
     parsed_json = json.loads(message["content"])
 
     existing_items = parsed_json.get("existing", [])
-    llm_existing = [item["tag"] for item in existing_items if isinstance(item, dict) and "tag" in item]
+    llm_existing = []
     for item in existing_items:
-        if isinstance(item, dict):
-            log_info(f"  tag={item.get('tag')!r} evidence={item.get('evidence', '')!r}")
+        if not isinstance(item, dict) or "tag" not in item:
+            continue
+        tag = item["tag"]
+        evidence = item.get("evidence", "")
+        log_info(f"  tag={tag!r} evidence={evidence!r}")
+        if _validate_tag_against_article(tag, evidence, article_text):
+            llm_existing.append(tag)
 
     return llm_existing, parsed_json.get("proposed_new", [])
 
@@ -2360,10 +2444,16 @@ Tag the following article:
 
     # Validate existing tags against allowed list
     existing_items = parsed.get("existing", [])
-    existing = [item["tag"] for item in existing_items if isinstance(item, dict) and "tag" in item and item["tag"] in allowed_tags][:max_tags]
+    existing = []
     for item in existing_items:
-        if isinstance(item, dict):
-            log_info(f"  tag={item.get('tag')!r} evidence={item.get('evidence', '')!r}")
+        if not isinstance(item, dict) or "tag" not in item or item["tag"] not in allowed_tags:
+            continue
+        tag = item["tag"]
+        evidence = item.get("evidence", "")
+        log_info(f"  tag={tag!r} evidence={evidence!r}")
+        if _validate_tag_against_article(tag, evidence, article_text):
+            existing.append(tag)
+    existing = existing[:max_tags]
     proposed = parsed.get("proposed_new", [])[:3]
 
     return existing, proposed
