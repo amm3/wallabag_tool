@@ -2206,7 +2206,7 @@ def html_to_text(html_content: str) -> str:
     return text.strip()
 
 
-def _validate_tag_against_article(tag: str, evidence: str, article_text: str) -> bool:
+def _validate_tag_against_article(tag: str, evidence: str, article_text: str, tag_notes: dict | None = None) -> bool:
     """Guard against LLM tag hallucinations.
 
     For tags whose name contains words ≥5 chars (real words, not abbreviations),
@@ -2216,8 +2216,10 @@ def _validate_tag_against_article(tag: str, evidence: str, article_text: str) ->
     article — so evidence-presence alone is not sufficient.
 
     For abbreviation/short tags (all words <5 chars, e.g. "ai", "ice", "nato"),
-    we fall back to checking that the evidence quote appears verbatim in the
-    article text.  If neither check applies, the tag passes by default.
+    we check whether the tag abbreviation itself OR any significant word (≥7 chars)
+    from the tag's TAGNOTES description appears in the article.  This allows
+    matching on either the acronym or its spelled-out expansion while still
+    rejecting hallucinated tags where neither appears.
     """
     text_lower = re.sub(r'\s+', ' ', article_text.lower())
 
@@ -2233,19 +2235,23 @@ def _validate_tag_against_article(tag: str, evidence: str, article_text: str) ->
         )
         return False
 
-    # Abbreviation/short tag — verify evidence appears in article
-    if evidence:
-        ev = re.sub(r'\s+', ' ', evidence.strip().lower())
-        if ev in text_lower:
-            return True
-        words = ev.split()
-        window = 6
-        if len(words) >= window:
-            for i in range(len(words) - window + 1):
-                if ' '.join(words[i:i + window]) in text_lower:
-                    return True
+    # Short/abbreviation tag — check tag itself or expansion words from TAGNOTES.
+    # We do NOT use the LLM's evidence quote as a proxy: the LLM can cite real
+    # article text while still hallucinating the tag.
+    check_terms = {p for p in parts if p}
+    if tag_notes and tag in tag_notes:
+        desc_words = re.split(r"[\s\-,.()/;:\"']+", tag_notes[tag].lower())
+        check_terms.update(w for w in desc_words if len(w) >= 7)
 
-    return True
+    for term in check_terms:
+        if re.search(r'\b' + re.escape(term) + r'\b', text_lower):
+            return True
+
+    log_warning(
+        f"Dropping tag '{tag}': neither abbreviation {parts!r} nor description "
+        f"keywords found in article. Evidence was: {evidence!r}"
+    )
+    return False
 
 
 def _build_tagging_system_prompt(tag_notes: dict | None = None) -> str:
@@ -2412,7 +2418,7 @@ def choose_tags_with_llm(api_key: str, model: str, article_text: str, allowed_ta
         tag = item["tag"]
         evidence = item.get("evidence", "")
         log_info(f"  tag={tag!r} evidence={evidence!r}")
-        if _validate_tag_against_article(tag, evidence, article_text):
+        if _validate_tag_against_article(tag, evidence, article_text, tag_notes):
             llm_existing.append(tag)
 
     return llm_existing, parsed_json.get("proposed_new", [])
@@ -2451,7 +2457,7 @@ Tag the following article:
         tag = item["tag"]
         evidence = item.get("evidence", "")
         log_info(f"  tag={tag!r} evidence={evidence!r}")
-        if _validate_tag_against_article(tag, evidence, article_text):
+        if _validate_tag_against_article(tag, evidence, article_text, tag_notes):
             existing.append(tag)
     existing = existing[:max_tags]
     proposed = parsed.get("proposed_new", [])[:3]
