@@ -6,7 +6,7 @@ import argparse
 import logging
 import configparser
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import zoneinfo
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import json
@@ -87,12 +87,20 @@ def main():
                         help="List all entries that have no tags")
     parser.add_argument("--untagged-exhaustive", action="store_true", default=False,
                         help="With --list-untagged/--retag-untagged: scan every page instead of stopping after 20 consecutive tagged entries")
-    parser.add_argument("--retag-untagged", action="store_true", default=False,
-                        help="Re-run LLM tagging on all entries that have no tags")
+    parser.add_argument("--retag-untagged", "-ru", action="store_true", default=False,
+                        help="Re-run LLM tagging on all unread entries that have no tags")
     parser.add_argument("--consolidate-tag", dest="consolidate_tag", metavar="SOURCE",
                         help="Merge all entries from SOURCE (label or numeric id) into --into TARGET, then delete SOURCE.")
     parser.add_argument("--into", dest="consolidate_into", metavar="TARGET",
                         help="Target tag label or numeric id for --consolidate-tag.")
+    parser.add_argument("--mark-read-older-than", "-mr", dest="mark_read_older_than", metavar="VALUE",
+                        help="Mark unread entries older than VALUE as read (archived). VALUE is a number "
+                             "of days (e.g. '90') or a date (e.g. '2025-01-01'). Skips starred entries "
+                             "unless --include-starred is given.")
+    parser.add_argument("--include-starred", action="store_true", default=False,
+                        help="With --mark-read-older-than: also mark starred entries (default: skip them)")
+    parser.add_argument("--dry-run", action="store_true", default=False,
+                        help="With --mark-read-older-than: list entries that would be marked, without changing anything")
 
     # HTML processing arguments
     parser.add_argument("--clean", action="store_true", default=False,
@@ -403,8 +411,9 @@ def main():
         log_debug("Obtained access token.")
 
         # Phase 1: Discover untagged entries (lightweight metadata scan)
-        write_out("Scanning for untagged entries...")
-        untagged = get_untagged_entries(base_url, token, detail="metadata", exhaustive=args.untagged_exhaustive)
+        write_out("Scanning for unread, untagged entries...")
+        untagged = get_untagged_entries(base_url, token, detail="metadata",
+                                         exhaustive=args.untagged_exhaustive, unread_only=True)
 
         if not untagged:
             write_out("No untagged entries found. Nothing to do.")
@@ -475,6 +484,55 @@ def main():
                 continue
 
         write_out(f"\nDone. Tagged: {tagged_count}, Skipped: {skipped_count}, Errors: {error_count}")
+        sys.exit(0)
+
+    ######################################
+    # Handle --mark-read-older-than operation
+    ######################################
+    if args.mark_read_older_than:
+        if args.id is not None:
+            log_fatal("--mark-read-older-than operates on all matching entries. Do not use with --id.", exit_code=2)
+        if args.url:
+            log_fatal("--mark-read-older-than cannot be combined with --url.", exit_code=2)
+        if args.html:
+            log_fatal("--mark-read-older-than cannot be combined with an HTML file/stdin argument.", exit_code=2)
+
+        cutoff = parse_age_cutoff(args.mark_read_older_than, tz=pub_tz)
+        write_out(f"Marking unread entries created before {cutoff.isoformat()} as read"
+                  f"{'' if args.include_starred else ' (skipping starred)'}...")
+
+        token = oauth_token_password_grant(base_url, client_id, client_secret, username, password)
+        log_debug("Obtained access token.")
+
+        candidates = get_entries_older_than(base_url, token, cutoff, include_starred=args.include_starred)
+
+        if not candidates:
+            write_out("No matching entries found. Nothing to do.")
+            sys.exit(0)
+
+        if args.dry_run:
+            write_out(f"Found {len(candidates)} entries that would be marked as read:")
+            for entry in candidates:
+                created_at = entry.get('created_at', '?')
+                write_out(f"  id={entry.get('id', '?')} created={created_at} title={entry.get('title', 'Untitled')!r}")
+            write_out("\nDry run: no changes made.")
+            sys.exit(0)
+
+        write_out(f"Found {len(candidates)} entries. Marking as read...")
+        marked_count = 0
+        error_count = 0
+        for i, entry in enumerate(candidates, 1):
+            entry_id = entry.get('id')
+            entry_title = entry.get('title', 'Untitled')
+            try:
+                patch_entry(base_url, token, entry_id, {"archive": 1})
+                write_out(f"[{i}/{len(candidates)}] Marked id={entry_id} title={entry_title!r} as read")
+                marked_count += 1
+            except Exception as e:
+                log_error(f"[{i}/{len(candidates)}] Failed to mark id={entry_id} as read: {e}")
+                error_count += 1
+
+        write_out(f"\nDone. Marked as read: {marked_count}, Errors: {error_count}")
         sys.exit(0)
 
     ######################################
@@ -918,6 +976,46 @@ def normalize_published_at(value, tz=None):
     return value
 
 
+def parse_entry_created_at(entry):
+    """Parse a Wallabag entry's created_at field to an aware datetime, or None."""
+    raw = entry.get("created_at")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def parse_age_cutoff(value, tz=None):
+    """Resolve a --mark-read-older-than value to an aware cutoff datetime.
+
+    Accepts a plain non-negative integer (days ago, e.g. '90') or anything
+    normalize_published_at() understands (bare date, human date+time, or full
+    ISO 8601). Entries with created_at before the returned datetime count as
+    "older than" the cutoff.
+
+    Fatal-exits if the resolved cutoff is in the future, since that would
+    otherwise silently match every entry.
+    """
+    value = value.strip()
+    if re.fullmatch(r'\d+', value):
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(value))
+    else:
+        cutoff = datetime.fromisoformat(normalize_published_at(value, tz=tz))
+
+    if cutoff > datetime.now(timezone.utc):
+        log_fatal(
+            f"--mark-read-older-than resolves to a cutoff in the future ({cutoff.isoformat()}). "
+            "Use a non-negative day count or a past date.",
+            exit_code=2,
+        )
+    return cutoff
+
+
 def _try_extract_json_at_pos(text, start):
     """Extract a balanced JSON object from text starting at position start (must be '{').
     Returns parsed dict/list or None."""
@@ -1308,7 +1406,7 @@ def get_last_entry(base_url, token):
     return None
 
 
-def get_untagged_entries(base_url, token, detail="metadata", exhaustive=False):
+def get_untagged_entries(base_url, token, detail="metadata", exhaustive=False, unread_only=False):
     """Fetch all entries that have no tags.
 
     Paginates through entries (newest first) and filters client-side since the
@@ -1319,6 +1417,7 @@ def get_untagged_entries(base_url, token, detail="metadata", exhaustive=False):
         token: OAuth access token.
         detail: "metadata" for lightweight listing, "full" to include HTML content.
         exhaustive: If False (default), stop after 20 consecutive tagged entries.
+        unread_only: If True, restrict to unread (non-archived) entries.
 
     Returns:
         List of entry dicts with zero tags.
@@ -1334,6 +1433,8 @@ def get_untagged_entries(base_url, token, detail="metadata", exhaustive=False):
 
     # First request to discover total pages
     params = {"perPage": per_page, "page": page, "detail": detail, "sort": "created", "order": "desc"}
+    if unread_only:
+        params["archive"] = "0"
     resp = requests.get(url, headers=headers, params=params, timeout=30)
     resp.raise_for_status()
     body = resp.json()
@@ -1344,6 +1445,8 @@ def get_untagged_entries(base_url, token, detail="metadata", exhaustive=False):
     while True:
         if page > 1:
             params = {"perPage": per_page, "page": page, "detail": detail, "sort": "created", "order": "desc"}
+            if unread_only:
+                params["archive"] = "0"
             resp = requests.get(url, headers=headers, params=params, timeout=30)
             resp.raise_for_status()
             body = resp.json()
@@ -1363,6 +1466,59 @@ def get_untagged_entries(base_url, token, detail="metadata", exhaustive=False):
             break
 
         if page >= total_pages:
+            break
+        page += 1
+
+    return results
+
+
+def get_entries_older_than(base_url, token, cutoff, include_starred=False):
+    """Fetch all unread entries created before `cutoff`, oldest first.
+
+    Paginates with server-side archive=0 (and starred=0 unless include_starred)
+    filters, sorted oldest-first, and stops as soon as an entry's created_at is
+    no longer older than cutoff -- everything later in the sort order is even
+    newer, so pagination doesn't need to continue past that point.
+
+    Args:
+        base_url: Wallabag instance base URL.
+        token: OAuth access token.
+        cutoff: aware datetime; entries with created_at < cutoff are returned.
+        include_starred: If False (default), also skip starred entries.
+
+    Returns:
+        List of entry metadata dicts, oldest first.
+    """
+    url = f"{base_url}/api/entries.json"
+    headers = {"Authorization": f"Bearer {token}"}
+    per_page = 30
+    page = 1
+    results = []
+
+    while True:
+        params = {"perPage": per_page, "page": page, "detail": "metadata",
+                  "sort": "created", "order": "asc", "archive": "0"}
+        if not include_starred:
+            params["starred"] = "0"
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        body = resp.json()
+        total_pages = body.get("pages", 1)
+        items = body.get("_embedded", {}).get("items", [])
+
+        stop = False
+        for entry in items:
+            if not include_starred and entry.get("is_starred"):
+                continue
+            created_at = parse_entry_created_at(entry)
+            if created_at is not None and created_at >= cutoff:
+                stop = True
+                break
+            results.append(entry)
+
+        print(f"  Scanned page {page}/{total_pages}, {len(results)} older than cutoff so far...", file=sys.stderr)
+
+        if stop or page >= total_pages:
             break
         page += 1
 

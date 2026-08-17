@@ -171,6 +171,24 @@ pbpaste | ./wallabag_tool.py --last -
 ./wallabag_tool.py --dump-html --id 123 > article.html
 ```
 
+### Mark Old Articles as Read
+
+Bulk-archive unread entries older than a given age, based on when they were saved (`created_at`). Starred entries are skipped by default.
+
+```bash
+# Preview what would be marked as read (no changes made)
+./wallabag_tool.py --mark-read-older-than 90 --dry-run
+
+# Mark unread entries saved more than 90 days ago as read
+./wallabag_tool.py --mark-read-older-than 90
+
+# Or use a cutoff date instead of a day count
+./wallabag_tool.py --mark-read-older-than 2025-01-01
+
+# Include starred entries too
+./wallabag_tool.py --mark-read-older-than 90 --include-starred
+```
+
 ## AI Features
 
 ### Automatic Tagging
@@ -204,10 +222,18 @@ pbpaste | wallabag_tool.py -l -
 wallabag_tool.py -lr
 ```
 
-**Retag all untagged articles** using LLM:
+**Retag all unread, untagged articles** using LLM:
 
 ```bash
-wallabag_tool.py --retag-untagged
+wallabag_tool.py -ru
+# equivalent to: wallabag_tool.py --retag-untagged
+```
+
+**Clear out old unread articles**, e.g. once a quarter:
+
+```bash
+wallabag_tool.py -mr 90
+# equivalent to: wallabag_tool.py --mark-read-older-than 90
 ```
 
 ## Advanced Usage
@@ -316,7 +342,9 @@ done < urls.txt
 ```
 usage: wallabag_tool.py [-h] [-v] [-vv] [-c [CONFIG]] [--url URL] [--title TITLE]
                         [--tags TAGS] [--skip-existing] [-i ID] [-l] [--list-tags]
-                        [--dump-html] [-r] [--clean] [--twitter] [--facebook]
+                        [--dump-html] [-r] [--consolidate-tag SOURCE --into TARGET]
+                        [-mr VALUE] [--include-starred] [--dry-run]
+                        [--clean] [--twitter] [--facebook] [--linkedin]
                         [HTML_FILE]
 
 Options:
@@ -339,6 +367,7 @@ Content:
   --clean               Use readability preprocessing to extract article content
   --twitter             Clean Twitter/X HTML from browser dev tools
   --facebook            Clean Facebook HTML from browser dev tools
+  --linkedin            Clean LinkedIn HTML from browser dev tools
 
 Other:
   --list-tags           List all tags
@@ -348,7 +377,13 @@ Other:
   --save-article        Save entry as self-contained HTML file (requires --id)
   -o, --output          Output filename for --save-article (default: <id>-<slug>.html)
   -r, --retag           Re-run LLM tagging on an existing entry
-  --retag-untagged      Re-run LLM tagging on all untagged entries
+  -ru, --retag-untagged Re-run LLM tagging on all unread, untagged entries
+  --consolidate-tag SOURCE --into TARGET
+                        Merge all entries tagged SOURCE into TARGET, then delete SOURCE
+  -mr, --mark-read-older-than VALUE
+                        Mark unread entries older than VALUE (days or a date) as read
+  --include-starred     With -mr: also mark starred entries (default: skip them)
+  --dry-run             With -mr: list matching entries without changing anything
 ```
 
 ## Tips & Best Practices
